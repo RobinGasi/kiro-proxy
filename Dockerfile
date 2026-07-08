@@ -21,6 +21,6 @@ RUN go build -trimpath \
 FROM gcr.io/distroless/static-debian12:nonroot
 WORKDIR /app
 COPY --from=build /out/kiro-proxy /app/kiro-proxy
-EXPOSE 8000
+EXPOSE 8442
 USER nonroot:nonroot
 ENTRYPOINT ["/app/kiro-proxy"]

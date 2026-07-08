@@ -39,7 +39,9 @@ var AppVersion = "0.0.0-dev"
 // Server defaults.
 const (
 	DefaultServerHost = "0.0.0.0"
-	DefaultServerPort = 8000
+	// DefaultServerPort is an uncommon port chosen to avoid clashing with the
+	// usual dev-server ports (3000/5000/8000/8080/…).
+	DefaultServerPort = 8442
 )
 
 // Shared defaults exported so leaf packages reference a single source of truth

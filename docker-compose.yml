@@ -6,7 +6,7 @@ services:
     container_name: kiro-proxy
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "8442:8442"
     env_file:
       - .env
     # Mount credentials.json / kiro-cli DB read-only when using ACCOUNT_SYSTEM
