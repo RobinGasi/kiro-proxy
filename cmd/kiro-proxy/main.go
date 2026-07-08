@@ -54,7 +54,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              bindHost + ":" + strconv.Itoa(bindPort),
-		Handler:           mux,
+		Handler:           requestLogger(mux, slog.Default()),
 		ReadHeaderTimeout: 30 * time.Second,
 		// No write/idle timeout: SSE streams are long-lived. Per-request
 		// deadlines are applied via context in the handlers/upstream client.
