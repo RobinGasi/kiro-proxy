@@ -535,7 +535,9 @@ fi
 export ANTHROPIC_BASE_URL="http://localhost:\$port"
 export ANTHROPIC_API_KEY="\$key"
 # Bare family names — the proxy resolves them to the newest model in each family.
-export ANTHROPIC_MODEL="\${ANTHROPIC_MODEL:-opus}"
+# The [1m] suffix tells Claude Code to use the 1M context window (Kiro serves it);
+# the proxy strips the suffix before resolving, so this stays "latest Opus".
+export ANTHROPIC_MODEL="\${ANTHROPIC_MODEL:-opus[1m]}"
 export ANTHROPIC_SMALL_FAST_MODEL="\${ANTHROPIC_SMALL_FAST_MODEL:-haiku}"
 
 # Opt out of all Claude Code analytics / telemetry / error reporting / auto-update.
@@ -708,7 +710,7 @@ EOF
 ${C_BOLD}Claude Code${C_RESET} (Anthropic-compatible):
   export ANTHROPIC_BASE_URL=http://localhost:$PORT
   export ANTHROPIC_API_KEY=$PROXY_API_KEY
-  export ANTHROPIC_MODEL=opus
+  export ANTHROPIC_MODEL='opus[1m]'   # newest Opus; [1m] = 1M context window
   export ANTHROPIC_SMALL_FAST_MODEL=haiku
   claude
 

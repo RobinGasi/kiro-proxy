@@ -113,7 +113,7 @@ Anthropic key):
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:8442
 export ANTHROPIC_API_KEY=<PROXY_API_KEY>
-export ANTHROPIC_MODEL=opus                       # family name → newest Opus
+export ANTHROPIC_MODEL='opus[1m]'                 # newest Opus; [1m] = 1M context
 export ANTHROPIC_SMALL_FAST_MODEL=haiku             # background / small tasks
 claude
 ```
