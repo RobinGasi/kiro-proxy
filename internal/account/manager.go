@@ -440,10 +440,12 @@ func (m *Manager) initAccount(ctx context.Context, a *Account) error {
 	a.resolver = resolver
 	a.initialized = true
 
-	// Best-effort initial model fetch; on failure the fallback list is kept.
+	// Best-effort initial model fetch; on failure the fallback list is kept. This
+	// is expected on Kiro regions that don't serve ListAvailableModels, so it is
+	// logged at INFO — the built-in fallback models keep the proxy fully usable.
 	if m.fetch != nil {
 		if err := cache.Refresh(ctx, m.fetchClosure(a)); err != nil {
-			m.log.Warn("initial model fetch failed; using fallback models", "id", a.id, "error", err)
+			m.log.Info("model catalog unavailable from Kiro; using built-in fallback models", "id", a.id, "error", err)
 		}
 	}
 	a.modelsCachedAt = time.Now()
@@ -463,7 +465,7 @@ func (m *Manager) maybeRefreshModels(ctx context.Context, a *Account) {
 		return
 	}
 	if err := a.cache.Refresh(ctx, m.fetchClosure(a)); err != nil {
-		m.log.Warn("model refresh failed; keeping stale cache", "id", a.id, "error", err)
+		m.log.Info("model catalog refresh failed; keeping cached models", "id", a.id, "error", err)
 		return
 	}
 	a.modelsCachedAt = time.Now()

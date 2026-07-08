@@ -75,12 +75,13 @@ func (c *ModelInfoCache) Refresh(ctx context.Context, fetch func(context.Context
 	}
 	ids, err := fetch(ctx)
 	if err != nil {
-		c.logger.Warn("model cache refresh failed; keeping existing contents", "error", err)
+		// Return the error and let the caller log the outcome once — the existing
+		// (or fallback) contents are kept either way.
 		return err
 	}
 	deduped := dedupe(ids)
 	if len(deduped) == 0 {
-		c.logger.Warn("model cache refresh returned no models; keeping existing contents")
+		c.logger.Debug("model cache refresh returned no models; keeping existing contents")
 		return nil
 	}
 
