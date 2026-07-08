@@ -49,7 +49,7 @@ run `kiro-cli login` first (Builder ID / IdC-SSO / social). Pass flags after
 
 | Flag | Purpose |
 |------|---------|
-| `--port N` | Port to expose (default `8000`) |
+| `--port N` | Port to expose (default `8442`) |
 | `--method docker\|source` | Force an install method (default: auto) |
 | `--refresh-token TOK` / `--profile-arn ARN` | Use a raw refresh token as the source |
 | `--assist` | If setup stalls, ask the kiro-cli AI for help |
@@ -64,7 +64,7 @@ the source method; `docker … kiro-proxy` for the Docker method).
 
 ```bash
 cp .env.example .env        # then fill in your credentials + PROXY_API_KEY
-go run ./cmd/kiro-proxy --port 8000
+go run ./cmd/kiro-proxy --port 8442
 # or build a static binary:
 go build -o kiro-proxy ./cmd/kiro-proxy && ./kiro-proxy
 ```
@@ -74,7 +74,7 @@ go build -o kiro-proxy ./cmd/kiro-proxy && ./kiro-proxy
 ```bash
 docker compose up -d
 # or:
-docker run -p 8000:8000 --env-file .env ghcr.io/robingasi/kiro-proxy:latest
+docker run -p 8442:8442 --env-file .env ghcr.io/robingasi/kiro-proxy:latest
 ```
 
 ## Authentication
@@ -97,11 +97,11 @@ for multi-account mode.
 ## Using with coding agents
 
 Point any OpenAI- or Anthropic-compatible client at the proxy. Start it first
-(`go run ./cmd/kiro-proxy --port 8000`), then configure your agent. Use a model
+(`go run ./cmd/kiro-proxy --port 8442`), then configure your agent. Use a model
 ID the proxy actually serves — list them with:
 
 ```bash
-curl -s http://localhost:8000/v1/models -H "Authorization: Bearer <PROXY_API_KEY>"
+curl -s http://localhost:8442/v1/models -H "Authorization: Bearer <PROXY_API_KEY>"
 ```
 
 ### Claude Code (Anthropic-compatible)
@@ -111,9 +111,9 @@ environment variables (`ANTHROPIC_API_KEY` here is your **proxy** key, not a rea
 Anthropic key):
 
 ```bash
-export ANTHROPIC_BASE_URL=http://localhost:8000
+export ANTHROPIC_BASE_URL=http://localhost:8442
 export ANTHROPIC_API_KEY=<PROXY_API_KEY>
-export ANTHROPIC_MODEL=claude-sonnet-4.5            # main model
+export ANTHROPIC_MODEL=claude-opus-4.8            # main model
 export ANTHROPIC_SMALL_FAST_MODEL=claude-haiku-4.5  # background / small tasks
 claude
 ```
@@ -121,7 +121,7 @@ claude
 Or per-session without exporting:
 
 ```bash
-ANTHROPIC_BASE_URL=http://localhost:8000 ANTHROPIC_API_KEY=<PROXY_API_KEY> claude
+ANTHROPIC_BASE_URL=http://localhost:8442 ANTHROPIC_API_KEY=<PROXY_API_KEY> claude
 ```
 
 > If you are logged into Claude Code with a subscription/OAuth session, log out
@@ -133,12 +133,12 @@ Codex talks to `/v1/chat/completions`. Add a custom provider to
 `~/.codex/config.toml`:
 
 ```toml
-model = "claude-sonnet-4.5"          # any id from GET /v1/models
+model = "claude-opus-4.8"          # any id from GET /v1/models
 model_provider = "kiro"
 
 [model_providers.kiro]
 name = "kiro-proxy"
-base_url = "http://localhost:8000/v1"
+base_url = "http://localhost:8442/v1"
 env_key = "PROXY_API_KEY"            # Codex reads the key from this env var
 wire_api = "chat"
 ```
