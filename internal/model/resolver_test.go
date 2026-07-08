@@ -149,11 +149,13 @@ func TestResolveBareFamilyToLatest(t *testing.T) {
 		nil, nil, nil,
 	)
 
-	// A bare family name resolves to the newest model of that family.
+	// A bare family name resolves to the newest model of that family — including
+	// with a context-window suffix like "opus[1m]" (used to request 1M context).
 	cases := map[string]string{
 		"opus":        "claude-opus-4.8",
 		"claude-opus": "claude-opus-4.8",
 		"OPUS":        "claude-opus-4.8",
+		"opus[1m]":    "claude-opus-4.8",
 		"sonnet":      "claude-sonnet-4.6",
 		"haiku":       "claude-haiku-4.5",
 	}

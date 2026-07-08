@@ -192,7 +192,10 @@ func (r *Resolver) Resolve(externalModel string) Resolution {
 // "" when externalModel is not a bare family name or the family has no known
 // models (in which case the caller passes the original through unchanged).
 func (r *Resolver) latestInFamily(externalModel string) string {
-	m := reBareFamily.FindStringSubmatch(strings.ToLower(strings.TrimSpace(externalModel)))
+	// Strip any context-window suffix ([1m]/[200k]) first, so "opus[1m]" — which a
+	// client appends to request the larger window — still resolves by family.
+	name := reContextSuffix.ReplaceAllString(strings.ToLower(strings.TrimSpace(externalModel)), "")
+	m := reBareFamily.FindStringSubmatch(name)
 	if m == nil {
 		return ""
 	}
