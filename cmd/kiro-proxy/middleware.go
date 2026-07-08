@@ -29,24 +29,17 @@ func requestLogger(next http.Handler, log *slog.Logger) http.Handler {
 }
 
 // statusWriter wraps http.ResponseWriter to capture the response status code
-// while transparently forwarding Flush so SSE streaming still works.
+// while transparently forwarding Flush so SSE streaming still works. The status
+// defaults to 200 (set in requestLogger) for handlers that write a body without
+// an explicit WriteHeader.
 type statusWriter struct {
 	http.ResponseWriter
 	status int
-	wrote  bool
 }
 
 func (w *statusWriter) WriteHeader(code int) {
-	if !w.wrote {
-		w.status = code
-		w.wrote = true
-	}
+	w.status = code
 	w.ResponseWriter.WriteHeader(code)
-}
-
-func (w *statusWriter) Write(b []byte) (int, error) {
-	w.wrote = true
-	return w.ResponseWriter.Write(b)
 }
 
 // Flush forwards to the underlying writer when it supports flushing (required

@@ -493,10 +493,15 @@ name_free() {
 # valid_name NAME -> 0 for a sane command name (letter/underscore start).
 valid_name() { printf '%s' "$1" | grep -Eq '^[A-Za-z_][A-Za-z0-9_-]*$'; }
 
+# Directories considered for the launcher command, in preference order. Shared by
+# pick_bindir (first writable, PATH-preferred) and find_existing_launcher (scans
+# all of them) so the two never drift.
+launcher_bindirs=("$HOME/.local/bin" "$HOME/bin" "/usr/local/bin")
+
 # pick_bindir chooses a writable install directory, preferring one already on PATH.
 pick_bindir() {
   local d
-  for d in "$HOME/.local/bin" "$HOME/bin" "/usr/local/bin"; do
+  for d in "${launcher_bindirs[@]}"; do
     case ":$PATH:" in *":$d:"*) [ -d "$d" ] && [ -w "$d" ] && { printf '%s' "$d"; return; } ;; esac
   done
   printf '%s' "$HOME/.local/bin"
@@ -562,7 +567,7 @@ EOF
 # existing launcher instead of prompting again.
 find_existing_launcher() {
   local d f
-  for d in "$HOME/.local/bin" "$HOME/bin" "/usr/local/bin"; do
+  for d in "${launcher_bindirs[@]}"; do
     [ -d "$d" ] || continue
     for f in "$d"/*; do
       [ -f "$f" ] || continue
@@ -617,18 +622,20 @@ prompt_alias_name() {
 install_launcher() {
   [ "$NO_ALIAS" = 1 ] && return 0
 
-  local name="$ALIAS_NAME" dir existing
-  existing="$(find_existing_launcher)"
+  local name="$ALIAS_NAME" dir
 
-  # Idempotent re-run: a launcher we installed already exists and no specific name
-  # was requested — refresh it in place, no prompt.
-  if [ -z "$name" ] && [ -n "$existing" ]; then
-    dir="$(dirname "$existing")"
-    if write_launcher "$(basename "$existing")" "$dir"; then
-      ok "Launcher '$LAUNCHER_NAME' already installed — refreshed ($LAUNCHER_PATH)."
-      maybe_add_to_path "$dir" || true
+  # Idempotent re-run: when no specific name was requested and a launcher we
+  # installed already exists, refresh it in place — no prompt.
+  if [ -z "$name" ]; then
+    local existing; existing="$(find_existing_launcher)"
+    if [ -n "$existing" ]; then
+      dir="$(dirname "$existing")"
+      if write_launcher "$(basename "$existing")" "$dir"; then
+        ok "Launcher '$LAUNCHER_NAME' already installed — refreshed ($LAUNCHER_PATH)."
+        maybe_add_to_path "$dir" || true
+      fi
+      return 0
     fi
-    return 0
   fi
 
   if [ -n "$name" ]; then
