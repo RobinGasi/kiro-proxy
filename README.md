@@ -113,8 +113,8 @@ Anthropic key):
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:8442
 export ANTHROPIC_API_KEY=<PROXY_API_KEY>
-export ANTHROPIC_MODEL=claude-opus-4.8            # main model
-export ANTHROPIC_SMALL_FAST_MODEL=claude-haiku-4.5  # background / small tasks
+export ANTHROPIC_MODEL=opus                       # family name → newest Opus
+export ANTHROPIC_SMALL_FAST_MODEL=haiku             # background / small tasks
 claude
 ```
 
@@ -133,7 +133,7 @@ Codex talks to `/v1/chat/completions`. Add a custom provider to
 `~/.codex/config.toml`:
 
 ```toml
-model = "claude-opus-4.8"          # any id from GET /v1/models
+model = "opus"                     # family name (→ newest Opus) or any id from GET /v1/models
 model_provider = "kiro"
 
 [model_providers.kiro]

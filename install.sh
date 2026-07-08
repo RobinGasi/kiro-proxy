@@ -529,8 +529,17 @@ fi
 
 export ANTHROPIC_BASE_URL="http://localhost:\$port"
 export ANTHROPIC_API_KEY="\$key"
-export ANTHROPIC_MODEL="\${ANTHROPIC_MODEL:-claude-opus-4.8}"
-export ANTHROPIC_SMALL_FAST_MODEL="\${ANTHROPIC_SMALL_FAST_MODEL:-claude-haiku-4.5}"
+# Bare family names — the proxy resolves them to the newest model in each family.
+export ANTHROPIC_MODEL="\${ANTHROPIC_MODEL:-opus}"
+export ANTHROPIC_SMALL_FAST_MODEL="\${ANTHROPIC_SMALL_FAST_MODEL:-haiku}"
+
+# Opt out of all Claude Code analytics / telemetry / error reporting / auto-update.
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+export DISABLE_TELEMETRY=1
+export DISABLE_ERROR_REPORTING=1
+export DISABLE_AUTOUPDATER=1
+export DISABLE_BUG_COMMAND=1
+export DO_NOT_TRACK=1
 
 if ! command -v claude >/dev/null 2>&1; then
   echo "kiro-proxy: 'claude' (Claude Code) is not on your PATH." >&2
@@ -692,8 +701,8 @@ EOF
 ${C_BOLD}Claude Code${C_RESET} (Anthropic-compatible):
   export ANTHROPIC_BASE_URL=http://localhost:$PORT
   export ANTHROPIC_API_KEY=$PROXY_API_KEY
-  export ANTHROPIC_MODEL=claude-opus-4.8
-  export ANTHROPIC_SMALL_FAST_MODEL=claude-haiku-4.5
+  export ANTHROPIC_MODEL=opus
+  export ANTHROPIC_SMALL_FAST_MODEL=haiku
   claude
 
 EOF
