@@ -138,3 +138,39 @@ func TestResolverPassthroughAndAlias(t *testing.T) {
 		t.Errorf("expected 'auto-kiro' in list, got %v", models)
 	}
 }
+
+func TestResolveBareFamilyToLatest(t *testing.T) {
+	r := NewResolver(
+		fakeCache{ids: []string{
+			"claude-opus-4.5", "claude-opus-4.8", "claude-opus-4.6",
+			"claude-sonnet-4", "claude-sonnet-4.6",
+			"claude-haiku-4.5",
+		}},
+		nil, nil, nil,
+	)
+
+	// A bare family name resolves to the newest model of that family.
+	cases := map[string]string{
+		"opus":        "claude-opus-4.8",
+		"claude-opus": "claude-opus-4.8",
+		"OPUS":        "claude-opus-4.8",
+		"sonnet":      "claude-sonnet-4.6",
+		"haiku":       "claude-haiku-4.5",
+	}
+	for in, want := range cases {
+		if got := r.Resolve(in).InternalID; got != want {
+			t.Errorf("Resolve(%q).InternalID = %q, want %q", in, got, want)
+		}
+	}
+
+	// A specific version is NOT treated as a bare family — it passes through.
+	if got := r.Resolve("claude-opus-4.6").InternalID; got != "claude-opus-4.6" {
+		t.Errorf("specific version was rewritten: %q", got)
+	}
+
+	// A family with no known models falls through unchanged.
+	empty := NewResolver(fakeCache{ids: []string{"claude-opus-4.8"}}, nil, nil, nil)
+	if got := empty.Resolve("haiku").InternalID; got != "haiku" {
+		t.Errorf("empty family should pass through, got %q", got)
+	}
+}

@@ -27,6 +27,10 @@ var (
 	reInverted      = regexp.MustCompile(`^claude-(\d+)\.(\d+)-(haiku|sonnet|opus)-(.+)$`)
 	reFamily        = regexp.MustCompile(`(?i)(haiku|sonnet|opus)`)
 	reVersion       = regexp.MustCompile(`(\d+)(?:\.(\d+))?`)
+	// reBareFamily matches a bare family name ("opus", "haiku", optionally with a
+	// "claude-" prefix) with NO version, so it can resolve to the latest available
+	// model of that family.
+	reBareFamily = regexp.MustCompile(`^(?:claude-)?(haiku|sonnet|opus)$`)
 )
 
 // Known input-context window sizes (in tokens) for Claude model families.
@@ -167,6 +171,10 @@ func (r *Resolver) Resolve(externalModel string) Resolution {
 	resolved := externalModel
 	if alias, ok := r.aliases[externalModel]; ok {
 		resolved = alias
+	} else if latest := r.latestInFamily(externalModel); latest != "" {
+		// A bare family name (e.g. "opus") resolves to the newest available model
+		// of that family, so clients can pin a family and auto-track new releases.
+		resolved = latest
 	}
 	normalized := NormalizeModelName(resolved)
 
@@ -177,6 +185,34 @@ func (r *Resolver) Resolve(externalModel string) Resolution {
 		return Resolution{InternalID: ToRuntimeModelID(internal), Source: "hidden", OriginalRequest: externalModel, Normalized: normalized, IsVerified: true}
 	}
 	return Resolution{InternalID: ToRuntimeModelID(normalized), Source: "passthrough", OriginalRequest: externalModel, Normalized: normalized, IsVerified: false}
+}
+
+// latestInFamily resolves a bare family name (e.g. "opus", "claude-haiku") to the
+// highest-version model of that family currently known to the cache. It returns
+// "" when externalModel is not a bare family name or the family has no known
+// models (in which case the caller passes the original through unchanged).
+func (r *Resolver) latestInFamily(externalModel string) string {
+	m := reBareFamily.FindStringSubmatch(strings.ToLower(strings.TrimSpace(externalModel)))
+	if m == nil {
+		return ""
+	}
+	family := m[1]
+
+	if r.cache == nil {
+		return ""
+	}
+	best := ""
+	bestMajor, bestMinor := -1, -1
+	for _, id := range r.cache.GetAllModelIDs() {
+		if ExtractModelFamily(id) != family {
+			continue
+		}
+		major, minor := modelVersion(NormalizeModelName(id))
+		if major > bestMajor || (major == bestMajor && minor > bestMinor) {
+			bestMajor, bestMinor, best = major, minor, id
+		}
+	}
+	return best
 }
 
 // GetAvailableModels returns the sorted union of cache + hidden + aliases,
