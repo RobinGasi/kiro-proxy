@@ -28,7 +28,7 @@ set -euo pipefail
 REPO="${KIRO_PROXY_REPO:-RobinGasi/kiro-proxy}"
 REF="${KIRO_PROXY_REF:-main}"
 DIR="${KIRO_PROXY_DIR:-$HOME/.kiro-proxy}"
-PORT="${KIRO_PROXY_PORT:-8000}"
+PORT="${KIRO_PROXY_PORT:-8442}"
 REGION="${KIRO_REGION:-us-east-1}"
 METHOD="${KIRO_PROXY_METHOD:-auto}"     # auto | docker | source
 ASSUME_YES=0
@@ -94,7 +94,7 @@ Usage: install.sh [options]
 
 Options:
   --dir PATH            Install/config dir            (default: $HOME/.kiro-proxy)
-  --port N              Port to expose                (default: 8000)
+  --port N              Port to expose                (default: 8442)
   --region REGION       KIRO_REGION                   (default: us-east-1)
   --method M            auto | docker | source        (default: auto)
   --refresh-token TOK   Use a raw Kiro refresh token as the credential source
@@ -382,20 +382,29 @@ install_docker() {
 
   docker rm -f kiro-proxy >/dev/null 2>&1 || true
 
+  # Build the argument list as an array so paths with spaces (e.g. macOS
+  # "Library/Application Support/…") survive intact.
+  # Map host:container to the same port and let the app bind $PORT inside (via
+  # SERVER_PORT in the env-file), so any --port works — not just the default.
+  local args=(-d --name kiro-proxy --restart unless-stopped
+    -p "$PORT:$PORT" --env-file "$ENV_FILE")
+
   # Mount a local credential file (SQLite/JSON) read-only and point the proxy at it.
-  local mount="" envover=""
   if [ "$CRED_KIND" = "sqlite" ] || [ "$CRED_KIND" = "creds_file" ]; then
     local cdir cbase
     cdir="$(cd "$(dirname "$CRED_PATH")" && pwd)"
     cbase="$(basename "$CRED_PATH")"
-    mount="-v $cdir:/creds:ro"
-    if [ "$CRED_KIND" = "sqlite" ]; then envover="-e KIRO_CLI_DB_FILE=/creds/$cbase";
-    else envover="-e KIRO_CREDS_FILE=/creds/$cbase"; fi
+    args+=(--mount "type=bind,source=$cdir,target=/creds,readonly")
+    if [ "$CRED_KIND" = "sqlite" ]; then args+=(-e "KIRO_CLI_DB_FILE=/creds/$cbase")
+    else args+=(-e "KIRO_CREDS_FILE=/creds/$cbase"); fi
   fi
 
-  # shellcheck disable=SC2086
-  docker run -d --name kiro-proxy --restart unless-stopped \
-    -p "$PORT:8000" --env-file "$ENV_FILE" $mount $envover "$IMAGE" >/dev/null
+  args+=("$IMAGE")
+
+  if ! docker run "${args[@]}" >/dev/null; then
+    warn "docker run failed."
+    return 1
+  fi
   RUN_METHOD="docker"
   ok "Container 'kiro-proxy' started."
 }
@@ -520,7 +529,7 @@ fi
 
 export ANTHROPIC_BASE_URL="http://localhost:\$port"
 export ANTHROPIC_API_KEY="\$key"
-export ANTHROPIC_MODEL="\${ANTHROPIC_MODEL:-claude-sonnet-4.5}"
+export ANTHROPIC_MODEL="\${ANTHROPIC_MODEL:-claude-opus-4.8}"
 export ANTHROPIC_SMALL_FAST_MODEL="\${ANTHROPIC_SMALL_FAST_MODEL:-claude-haiku-4.5}"
 
 if ! command -v claude >/dev/null 2>&1; then
@@ -537,7 +546,20 @@ EOF
   chmod +x "$target" 2>/dev/null || true
   LAUNCHER_NAME="$name"
   LAUNCHER_PATH="$target"
-  ok "Installed launcher: $target"
+}
+
+# find_existing_launcher — echoes the path of a launcher we previously installed
+# (searching the dirs pick_bindir considers), or nothing. Lets re-runs refresh an
+# existing launcher instead of prompting again.
+find_existing_launcher() {
+  local d f
+  for d in "$HOME/.local/bin" "$HOME/bin" "/usr/local/bin"; do
+    [ -d "$d" ] || continue
+    for f in "$d"/*; do
+      [ -f "$f" ] || continue
+      if launcher_is_ours "$f"; then printf '%s' "$f"; return; fi
+    done
+  done
 }
 
 # maybe_add_to_path DIR — ensure DIR is on PATH. Interactively it offers to add
@@ -586,7 +608,20 @@ prompt_alias_name() {
 install_launcher() {
   [ "$NO_ALIAS" = 1 ] && return 0
 
-  local name="$ALIAS_NAME"
+  local name="$ALIAS_NAME" dir existing
+  existing="$(find_existing_launcher)"
+
+  # Idempotent re-run: a launcher we installed already exists and no specific name
+  # was requested — refresh it in place, no prompt.
+  if [ -z "$name" ] && [ -n "$existing" ]; then
+    dir="$(dirname "$existing")"
+    if write_launcher "$(basename "$existing")" "$dir"; then
+      ok "Launcher '$LAUNCHER_NAME' already installed — refreshed ($LAUNCHER_PATH)."
+      maybe_add_to_path "$dir" || true
+    fi
+    return 0
+  fi
+
   if [ -n "$name" ]; then
     # Name supplied via flag/env: validate and check for collisions, don't loop.
     valid_name "$name" || { warn "Ignoring invalid --alias '$name'."; return 0; }
@@ -602,11 +637,13 @@ install_launcher() {
     [ -z "$name" ] && { warn "Skipping launcher."; return 0; }
   fi
 
-  local dir; dir="$(pick_bindir)"
+  dir="$(pick_bindir)"
   # A launcher write failure must never abort the installer (the proxy is already
   # running by this point) — skip gracefully so summary() still prints.
-  write_launcher "$name" "$dir" || return 0
-  maybe_add_to_path "$dir" || true
+  if write_launcher "$name" "$dir"; then
+    ok "Installed launcher: $LAUNCHER_PATH"
+    maybe_add_to_path "$dir" || true
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -655,7 +692,7 @@ EOF
 ${C_BOLD}Claude Code${C_RESET} (Anthropic-compatible):
   export ANTHROPIC_BASE_URL=http://localhost:$PORT
   export ANTHROPIC_API_KEY=$PROXY_API_KEY
-  export ANTHROPIC_MODEL=claude-sonnet-4.5
+  export ANTHROPIC_MODEL=claude-opus-4.8
   export ANTHROPIC_SMALL_FAST_MODEL=claude-haiku-4.5
   claude
 
