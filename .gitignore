@@ -1,0 +1,21 @@
+# Secrets / runtime state
+.env
+credentials.json
+state.json
+debug_logs/
+*.sqlite3
+
+# Build artifacts
+/kiro-proxy
+/dist/
+/out/
+
+# Go
+*.test
+*.out
+coverage.*
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

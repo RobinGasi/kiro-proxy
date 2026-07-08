@@ -1,0 +1,13 @@
+# Runtime image built by GoReleaser (dockers_v2) from the prebuilt, statically
+# linked binaries. GoReleaser lays the build context out per platform, so the
+# binary for the target arch lives at ${TARGETPLATFORM}/kiro-proxy.
+#
+# Kept separate from the top-level Dockerfile, which builds from source for local
+# `docker build` and docker-compose use.
+FROM gcr.io/distroless/static-debian12:nonroot
+ARG TARGETPLATFORM
+WORKDIR /app
+COPY ${TARGETPLATFORM}/kiro-proxy /app/kiro-proxy
+EXPOSE 8000
+USER nonroot:nonroot
+ENTRYPOINT ["/app/kiro-proxy"]

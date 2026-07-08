@@ -1,0 +1,22 @@
+services:
+  kiro-proxy:
+    image: ghcr.io/robingasi/kiro-proxy:latest
+    # To build locally instead of pulling, comment out `image:` above and use:
+    # build: .
+    container_name: kiro-proxy
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    # Mount credentials.json / kiro-cli DB read-only when using ACCOUNT_SYSTEM
+    # or SQLite auth. SQLITE_READONLY=true is recommended when sharing the
+    # kiro-cli database with a running kiro-cli (avoids the refresh-token race).
+    volumes:
+      - ./credentials.json:/app/credentials.json:ro
+      - ./state.json:/app/state.json
+    healthcheck:
+      test: ["CMD", "/app/kiro-proxy", "--version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
