@@ -179,10 +179,14 @@ func BuildKiroPayload(ctx context.Context, cfg *config.Config, in Request, profi
 	if err != nil {
 		return nil, nil, err
 	}
-	if stats.Trimmed {
-		slog.Info("trimmed conversation history",
+	if stats.Trimmed || stats.ContentTruncated || stats.HistoryCleared || stats.ImagesStripped {
+		slog.Info("reduced payload for Kiro API limit",
 			"original_entries", stats.OriginalEntries, "final_entries", stats.FinalEntries,
-			"original_bytes", stats.OriginalBytes, "final_bytes", stats.FinalBytes)
+			"original_bytes", stats.OriginalBytes, "final_bytes", stats.FinalBytes,
+			"history_trimmed", stats.Trimmed,
+			"content_truncated", stats.ContentTruncated,
+			"history_cleared", stats.HistoryCleared,
+			"images_stripped", stats.ImagesStripped)
 	}
 
 	body, err := json.Marshal(payload)

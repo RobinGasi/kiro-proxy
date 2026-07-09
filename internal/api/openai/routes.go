@@ -175,7 +175,7 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		var tooLarge *payloadguard.PayloadTooLargeError
 		if errors.As(err, &tooLarge) {
-			h.writeError(w, http.StatusRequestEntityTooLarge, tooLarge.Error())
+			h.writeError(w, http.StatusBadRequest, tooLarge.Error())
 			return
 		}
 		if errors.Is(err, converter.ErrNoMessages) {

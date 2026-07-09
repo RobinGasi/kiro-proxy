@@ -214,7 +214,7 @@ func Load() *Config {
 		FakeReasoningInitialBuffer: getEnvInt("FAKE_REASONING_INITIAL_BUFFER_SIZE", 20),
 
 		KiroMaxPayloadBytes: getEnvInt("KIRO_MAX_PAYLOAD_BYTES", 600000),
-		AutoTrimPayload:     getEnvBool("AUTO_TRIM_PAYLOAD", false),
+		AutoTrimPayload:     getEnvBool("AUTO_TRIM_PAYLOAD", true),
 
 		WebSearchEnabled: getEnvBool("WEB_SEARCH_ENABLED", true),
 

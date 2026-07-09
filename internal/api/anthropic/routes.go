@@ -134,7 +134,7 @@ func (h *Handler) handleMessages(w http.ResponseWriter, r *http.Request) {
 		var tooLarge *payloadguard.PayloadTooLargeError
 		switch {
 		case errors.As(err, &tooLarge):
-			writeError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", tooLarge.Error())
+			writeError(w, http.StatusBadRequest, "invalid_request_error", tooLarge.Error())
 		case errors.Is(err, converter.ErrNoMessages):
 			writeError(w, http.StatusBadRequest, "invalid_request_error", "No messages to send.")
 		default:
@@ -295,7 +295,7 @@ func classifyUpstreamError(err error) (status int, reason string, message string
 
 	var tooLarge *payloadguard.PayloadTooLargeError
 	if errors.As(err, &tooLarge) {
-		return http.StatusRequestEntityTooLarge, "", tooLarge.Error()
+		return http.StatusBadRequest, "", tooLarge.Error()
 	}
 
 	return http.StatusInternalServerError, "", err.Error()

@@ -5,7 +5,8 @@
 // package measures the serialized size of an outgoing Kiro payload and, when it
 // exceeds the configured limit (config.KiroMaxPayloadBytes), either reports a
 // clear error or — when auto-trimming is enabled (config.AutoTrimPayload) —
-// drops the oldest conversation-history entries until the payload fits.
+// progressively reduces the payload via history trimming, head/tail content
+// truncation, history clearing, and image stripping.
 //
 // It operates on the same in-memory representation used elsewhere for the Kiro
 // payload: a map[string]any decoded from / destined for JSON. Maps are mutated
@@ -30,6 +31,12 @@ type TrimStats struct {
 	FinalEntries int
 	// Trimmed reports whether any history entries were removed.
 	Trimmed bool
+	// ContentTruncated reports whether inline text (messages, tool results) was shortened.
+	ContentTruncated bool
+	// HistoryCleared reports whether all history was dropped as a last resort.
+	HistoryCleared bool
+	// ImagesStripped reports whether image attachments were removed to save space.
+	ImagesStripped bool
 }
 
 // PayloadTooLargeError is returned by [Guard] when a payload exceeds the
@@ -43,7 +50,12 @@ type PayloadTooLargeError struct {
 
 // Error implements the error interface.
 func (e *PayloadTooLargeError) Error() string {
-	return fmt.Sprintf("kiro payload is %d bytes, exceeding the maximum of %d bytes", e.Size, e.MaxBytes)
+	return fmt.Sprintf(
+		"conversation context is too large for the Kiro API (%d bytes, limit %d). "+
+			"Use /compact in your client or reduce tool output size; "+
+			"enable AUTO_TRIM_PAYLOAD=true to let the proxy trim automatically",
+		e.Size, e.MaxBytes,
+	)
 }
 
 // CheckPayloadSize returns the serialized byte size of the payload.
@@ -67,10 +79,9 @@ func CheckPayloadSize(payload map[string]any) (int, error) {
 //     Trimmed=false are returned.
 //   - If it exceeds the limit and autoTrim is false, the payload is left
 //     untouched and a *PayloadTooLargeError is returned.
-//   - If it exceeds the limit and autoTrim is true, the oldest history entries
-//     are trimmed in place via [TrimPayloadToLimit]. If the result still exceeds
-//     the limit (history cannot shrink below two entries), the returned stats
-//     describe the trim and a *PayloadTooLargeError is returned as well.
+//   - If it exceeds the limit and autoTrim is true, progressively reduces the
+//     payload: oldest history pairs, inline content truncation, history clear,
+//     and image stripping via [enforceLimit].
 //
 // Callers pass config.KiroMaxPayloadBytes and config.AutoTrimPayload.
 func Guard(payload map[string]any, maxBytes int, autoTrim bool) (TrimStats, error) {
@@ -96,14 +107,7 @@ func Guard(payload map[string]any, maxBytes int, autoTrim bool) (TrimStats, erro
 		return noop, &PayloadTooLargeError{Size: size, MaxBytes: maxBytes}
 	}
 
-	stats, err := TrimPayloadToLimit(payload, maxBytes)
-	if err != nil {
-		return TrimStats{}, err
-	}
-	if stats.FinalBytes > maxBytes {
-		return stats, &PayloadTooLargeError{Size: stats.FinalBytes, MaxBytes: maxBytes}
-	}
-	return stats, nil
+	return enforceLimit(payload, maxBytes)
 }
 
 // TrimPayloadToLimit trims the oldest conversation-history entries so the
