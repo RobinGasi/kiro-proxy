@@ -32,7 +32,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/RobinGasi/kiro-proxy/internal/util"
+	"git.gasi.dev/robin/kiro-proxy/internal/util"
 )
 
 // Best-effort assumptions about Kiro's non-streaming usage-limits operation.

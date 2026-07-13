@@ -1,6 +1,6 @@
 // Package modelcache provides an in-memory, thread-safe cache of the model IDs
 // that Kiro currently exposes via ListAvailableModels. It implements the
-// github.com/RobinGasi/kiro-proxy/internal/model.Cache interface so the model
+// git.gasi.dev/robin/kiro-proxy/internal/model.Cache interface so the model
 // resolver can verify whether a (normalized) model name is known.
 //
 // The cache holds a TTL and a last-refresh timestamp. It never performs any HTTP
@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/RobinGasi/kiro-proxy/internal/model"
+	"git.gasi.dev/robin/kiro-proxy/internal/model"
 )
 
 // Compile-time guarantee that *ModelInfoCache satisfies the resolver's Cache.

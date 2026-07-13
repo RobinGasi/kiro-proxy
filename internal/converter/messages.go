@@ -118,8 +118,7 @@ func ensureAssistantBeforeToolResults(messages []Message) ([]Message, bool) {
 
 // mergeAdjacentMessages merges consecutive messages with the same role, since
 // Kiro does not accept multiple consecutive messages from one role. Content
-// blocks, tool calls and tool results are concatenated (images are intentionally
-// not merged).
+// blocks, tool calls, tool results and images are concatenated.
 func mergeAdjacentMessages(messages []Message) []Message {
 	if len(messages) == 0 {
 		return nil
@@ -151,6 +150,9 @@ func mergeAdjacentMessages(messages []Message) []Message {
 			if msg.Role == "user" && len(msg.ToolResults) > 0 {
 				merged[li].ToolResults = append(append([]ToolResult{}, merged[li].ToolResults...), msg.ToolResults...)
 				totalResults += len(msg.ToolResults)
+			}
+			if len(msg.Images) > 0 {
+				merged[li].Images = append(append([]Image{}, merged[li].Images...), msg.Images...)
 			}
 
 			if _, ok := mergeCounts[msg.Role]; ok {

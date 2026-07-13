@@ -1,8 +1,9 @@
-module github.com/RobinGasi/kiro-proxy
+module git.gasi.dev/robin/kiro-proxy
 
 go 1.26.4
 
 require (
+	golang.org/x/image v0.40.0
 	golang.org/x/net v0.56.0
 	modernc.org/sqlite v1.53.0
 )

@@ -20,7 +20,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/RobinGasi/kiro-proxy/internal/config"
+	"git.gasi.dev/robin/kiro-proxy/internal/config"
 )
 
 // Handling modes for thinking content, mirroring config.FakeReasoningHandling.

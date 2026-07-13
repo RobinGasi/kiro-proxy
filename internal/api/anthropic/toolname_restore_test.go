@@ -3,9 +3,9 @@ package anthropic
 import (
 	"testing"
 
-	"github.com/RobinGasi/kiro-proxy/internal/awsstream"
-	"github.com/RobinGasi/kiro-proxy/internal/converter"
-	"github.com/RobinGasi/kiro-proxy/internal/streaming"
+	"git.gasi.dev/robin/kiro-proxy/internal/awsstream"
+	"git.gasi.dev/robin/kiro-proxy/internal/converter"
+	"git.gasi.dev/robin/kiro-proxy/internal/streaming"
 )
 
 // TestBuildMessagesResponseRestoresToolName verifies that a tool_use block whose

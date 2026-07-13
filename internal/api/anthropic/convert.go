@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"log/slog"
 
-	"github.com/RobinGasi/kiro-proxy/internal/converter"
+	"git.gasi.dev/robin/kiro-proxy/internal/converter"
 )
 
 // buildConverterRequest turns a parsed Anthropic *MessagesRequest into the

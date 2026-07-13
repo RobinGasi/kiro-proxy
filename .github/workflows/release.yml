@@ -2,14 +2,15 @@ name: release
 
 # Conventional-commit-driven release. semantic-release analyzes the commits on
 # main, computes the next semver and pushes the tag; GoReleaser then builds the
-# binaries, creates the GitHub Release, and pushes the multi-arch image to GHCR.
+# binaries, creates the Gitea Release, and pushes the multi-arch image to the
+# Gitea container registry. Runs under Gitea Actions (needs a registered runner).
 on:
   push:
     branches: [main]
 
 permissions:
   contents: write # semantic-release pushes tags; GoReleaser creates releases
-  packages: write # push images to GHCR
+  packages: write # push images to the Gitea container registry
 
 concurrency:
   group: release-${{ github.ref }}
@@ -69,11 +70,11 @@ jobs:
         if: steps.semrel.outputs.new_release_published == 'true'
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GHCR
+      - name: Log in to the Gitea container registry
         if: steps.semrel.outputs.new_release_published == 'true'
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: git.gasi.dev
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 

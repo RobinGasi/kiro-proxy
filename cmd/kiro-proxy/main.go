@@ -15,7 +15,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/RobinGasi/kiro-proxy/internal/config"
+	"git.gasi.dev/robin/kiro-proxy/internal/config"
 )
 
 func main() {

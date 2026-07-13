@@ -25,10 +25,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/RobinGasi/kiro-proxy/internal/awsstream"
-	"github.com/RobinGasi/kiro-proxy/internal/config"
-	"github.com/RobinGasi/kiro-proxy/internal/thinking"
-	"github.com/RobinGasi/kiro-proxy/internal/tokenizer"
+	"git.gasi.dev/robin/kiro-proxy/internal/awsstream"
+	"git.gasi.dev/robin/kiro-proxy/internal/config"
+	"git.gasi.dev/robin/kiro-proxy/internal/thinking"
+	"git.gasi.dev/robin/kiro-proxy/internal/tokenizer"
 )
 
 // Default streaming timeouts, applied when the corresponding config value is

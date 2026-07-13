@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 
-	"github.com/RobinGasi/kiro-proxy/internal/converter"
+	"git.gasi.dev/robin/kiro-proxy/internal/converter"
 )
 
 // toConverterRequest builds a converter.Request from a ChatCompletionRequest.

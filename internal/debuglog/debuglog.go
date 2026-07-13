@@ -37,7 +37,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/RobinGasi/kiro-proxy/internal/config"
+	"git.gasi.dev/robin/kiro-proxy/internal/config"
 )
 
 // Debug modes, mirroring config.DebugMode.

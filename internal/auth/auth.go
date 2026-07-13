@@ -19,8 +19,8 @@ import (
 
 	_ "modernc.org/sqlite" // pure-Go, cgo-free SQLite driver (driver name "sqlite")
 
-	"github.com/RobinGasi/kiro-proxy/internal/config"
-	"github.com/RobinGasi/kiro-proxy/internal/util"
+	"git.gasi.dev/robin/kiro-proxy/internal/config"
+	"git.gasi.dev/robin/kiro-proxy/internal/util"
 )
 
 // AuthType is the authentication mechanism backing a manager.

@@ -70,6 +70,10 @@ func enforceLimit(payload map[string]any, maxBytes int) (TrimStats, error) {
 			stats.FinalEntries = historyEntries(payload)
 			continue
 		}
+		if shrunk := shrinkLargestImage(payload, excess); shrunk {
+			stats.ImagesShrunk = true
+			continue
+		}
 		if stripped := stripAllImages(payload); stripped {
 			stats.ImagesStripped = true
 			continue
@@ -93,6 +97,7 @@ func mergeTrimStats(dst *TrimStats, src TrimStats) {
 	dst.Trimmed = dst.Trimmed || src.Trimmed
 	dst.ContentTruncated = dst.ContentTruncated || src.ContentTruncated
 	dst.HistoryCleared = dst.HistoryCleared || src.HistoryCleared
+	dst.ImagesShrunk = dst.ImagesShrunk || src.ImagesShrunk
 	dst.ImagesStripped = dst.ImagesStripped || src.ImagesStripped
 	dst.FinalBytes = src.FinalBytes
 	dst.FinalEntries = src.FinalEntries

@@ -8,16 +8,16 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/RobinGasi/kiro-proxy/internal/account"
-	"github.com/RobinGasi/kiro-proxy/internal/apiauth"
-	"github.com/RobinGasi/kiro-proxy/internal/config"
-	"github.com/RobinGasi/kiro-proxy/internal/converter"
-	"github.com/RobinGasi/kiro-proxy/internal/mcp"
-	"github.com/RobinGasi/kiro-proxy/internal/model"
-	"github.com/RobinGasi/kiro-proxy/internal/payloadguard"
-	"github.com/RobinGasi/kiro-proxy/internal/streaming"
-	"github.com/RobinGasi/kiro-proxy/internal/upstream"
-	"github.com/RobinGasi/kiro-proxy/internal/usage"
+	"git.gasi.dev/robin/kiro-proxy/internal/account"
+	"git.gasi.dev/robin/kiro-proxy/internal/apiauth"
+	"git.gasi.dev/robin/kiro-proxy/internal/config"
+	"git.gasi.dev/robin/kiro-proxy/internal/converter"
+	"git.gasi.dev/robin/kiro-proxy/internal/mcp"
+	"git.gasi.dev/robin/kiro-proxy/internal/model"
+	"git.gasi.dev/robin/kiro-proxy/internal/payloadguard"
+	"git.gasi.dev/robin/kiro-proxy/internal/streaming"
+	"git.gasi.dev/robin/kiro-proxy/internal/upstream"
+	"git.gasi.dev/robin/kiro-proxy/internal/usage"
 )
 
 // Deps carries the collaborators a Handler needs.

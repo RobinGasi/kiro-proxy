@@ -35,6 +35,9 @@ type TrimStats struct {
 	ContentTruncated bool
 	// HistoryCleared reports whether all history was dropped as a last resort.
 	HistoryCleared bool
+	// ImagesShrunk reports whether any image attachment was downscaled/re-encoded
+	// to fit the limit (preferred over dropping it).
+	ImagesShrunk bool
 	// ImagesStripped reports whether image attachments were removed to save space.
 	ImagesStripped bool
 }

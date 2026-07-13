@@ -14,7 +14,7 @@ ARG VERSION=0.0.0-dev
 # CGO disabled -> fully static binary (modernc.org/sqlite is pure Go).
 ENV CGO_ENABLED=0
 RUN go build -trimpath \
-    -ldflags="-s -w -X github.com/RobinGasi/kiro-proxy/internal/config.AppVersion=${VERSION}" \
+    -ldflags="-s -w -X git.gasi.dev/robin/kiro-proxy/internal/config.AppVersion=${VERSION}" \
     -o /out/kiro-proxy ./cmd/kiro-proxy
 
 # --- runtime stage ---

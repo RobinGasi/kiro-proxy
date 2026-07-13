@@ -7,7 +7,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	"github.com/RobinGasi/kiro-proxy/internal/config"
+	"git.gasi.dev/robin/kiro-proxy/internal/config"
 )
 
 func TestShortenToolNameLeavesShortNamesUnchanged(t *testing.T) {
