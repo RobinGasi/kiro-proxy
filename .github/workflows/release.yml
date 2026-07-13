@@ -40,9 +40,8 @@ jobs:
           go-version: "1.26"
 
       # semantic-release owns versioning: analyze commits, compute the next
-      # semver, and push the git tag. It does NOT create the GitHub Release
-      # (no @semantic-release/github plugin) — GoReleaser owns that, so the two
-      # never collide over GitHub's now-immutable releases.
+      # semver, and push the git tag. It does NOT create the release (no publish
+      # plugin) — GoReleaser owns that.
       - name: Semantic release (tag only)
         id: semrel
         uses: cycjimmy/semantic-release-action@v4
@@ -84,6 +83,11 @@ jobs:
         with:
           distribution: goreleaser
           version: "~> v2"
-          args: release --clean --release-notes=/tmp/release-notes.md
+          # --skip=docker: publish binaries + the Gitea release only. The
+          # multi-arch container build needs Docker (buildx/qemu) on the runner
+          # and the Gitea container registry; drop this flag to re-enable it.
+          args: release --clean --skip=docker --release-notes=/tmp/release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GoReleaser's Gitea release publisher authenticates via GITEA_TOKEN.
+          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
