@@ -76,6 +76,10 @@ jobs:
           # and the Gitea container registry; drop this flag to re-enable it.
           args: release --clean --skip=docker --release-notes=/tmp/release-notes.md
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # GoReleaser's Gitea release publisher authenticates via GITEA_TOKEN.
+          # Forgejo/Gitea Actions auto-injects GITHUB_TOKEN into every step, and
+          # GoReleaser picks its target forge from whichever token env var is set.
+          # Setting both GITHUB_TOKEN and GITEA_TOKEN errors "multiple tokens
+          # found"; a lone GITHUB_TOKEN would target github.com. GORELEASER_FORCE_TOKEN
+          # forces Gitea mode using the same auto-injected token — no PAT needed.
+          GORELEASER_FORCE_TOKEN: gitea
           GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
