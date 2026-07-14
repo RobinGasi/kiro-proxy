@@ -61,37 +61,25 @@ jobs:
           NOTES: ${{ steps.semrel.outputs.new_release_notes }}
         run: printf '%s' "$NOTES" > /tmp/release-notes.md
 
-      - name: Set up QEMU
-        if: steps.semrel.outputs.new_release_published == 'true'
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Buildx
-        if: steps.semrel.outputs.new_release_published == 'true'
-        uses: docker/setup-buildx-action@v3
-
-      # Push the multi-arch image to the Gitea container registry using the
-      # auto-injected Actions token (this job has packages: write). If your
-      # Forgejo version rejects the auto token for package pushes, swap the
-      # password for a PAT secret that has write:package.
-      - name: Log in to the Gitea container registry
-        if: steps.semrel.outputs.new_release_published == 'true'
-        uses: docker/login-action@v3
-        with:
-          registry: git.gasi.dev
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
+      # Binaries-only release: the Docker steps (QEMU / Buildx / registry login)
+      # and GoReleaser's dockers_v2 are omitted until the runner has Docker and
+      # the Gitea container registry is enabled. To publish the multi-arch image,
+      # restore those three steps and drop --skip=docker below.
       - name: GoReleaser
         if: steps.semrel.outputs.new_release_published == 'true'
         uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
           version: "~> v2"
-          args: release --clean --release-notes=/tmp/release-notes.md
+          # --skip=docker: publish binaries + the Gitea release only. The
+          # multi-arch container build needs Docker (buildx/qemu) on the runner
+          # and the Gitea container registry; drop this flag to re-enable it.
+          args: release --clean --skip=docker --release-notes=/tmp/release-notes.md
         env:
-          # Forgejo auto-injects GITHUB_TOKEN into every step; GoReleaser picks
-          # the target forge from the token env var. Setting both GITHUB_TOKEN and
-          # GITEA_TOKEN errors "multiple tokens found", and a lone GITHUB_TOKEN
-          # would target github.com — so force Gitea mode with the auto token.
+          # Forgejo/Gitea Actions auto-injects GITHUB_TOKEN into every step, and
+          # GoReleaser picks its target forge from whichever token env var is set.
+          # Setting both GITHUB_TOKEN and GITEA_TOKEN errors "multiple tokens
+          # found"; a lone GITHUB_TOKEN would target github.com. GORELEASER_FORCE_TOKEN
+          # forces Gitea mode using the same auto-injected token — no PAT needed.
           GORELEASER_FORCE_TOKEN: gitea
           GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
