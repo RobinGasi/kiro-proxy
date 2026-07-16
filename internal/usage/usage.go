@@ -13,9 +13,10 @@
 // This package backs a GET /v1/usage endpoint and lets routes add a
 // credits_used field into response usage objects.
 //
-// IMPORTANT: Kiro's usage-limits API is not publicly documented. The endpoint
-// path, x-amz-target, request body and response shape used by FetchLimits are
-// best-effort assumptions (see the constants and comments below). FetchLimits is
+// Kiro's usage-limits API is undocumented but was recovered from the IDE's own
+// GetUsageLimitsCommand call (captured in q-client.log): a GET at /GetUsageLimits
+// on the profile's home-region runtime host, with origin/profileArn/resourceType
+// query params, returning a usageBreakdownList. FetchLimits mirrors that. It stays
 // deliberately defensive: any failure — transport error, non-2xx status, or an
 // unrecognized response shape — returns a descriptive error instead of panicking,
 // so the calling route can degrade gracefully (e.g. omit credit balance).
@@ -28,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -35,16 +37,28 @@ import (
 	"git.gasi.dev/robin/kiro-proxy/internal/util"
 )
 
-// Best-effort assumptions about Kiro's non-streaming usage-limits operation.
+// Kiro's non-streaming usage-limits operation, recovered from the IDE bundle.
 //
-// The Kiro runtime exposes named, path-per-operation endpoints over the AWS
-// JSON-1.0 protocol (e.g. /generateAssistantResponse, /listAvailableModels,
-// /mcp). By analogy the usage-limits operation is assumed to live at
-// /getUsageLimits with an x-amz-target on the non-streaming CodeWhisperer
-// service. If these are wrong the call will fail with a clear error.
+// GetUsageLimits belongs to the non-streaming AmazonCodeWhispererService (Kiro's
+// CodeWhispererRuntimeClient), which resolves to the AWS Q data-plane endpoint
+// https://q.<region>.amazonaws.com — NOT the runtime.<region>.kiro.dev host that
+// serves the streaming GenerateAssistantResponse op (usage-limits 404s there,
+// and so does ListAvailableModels — the proxy quietly falls back to a static
+// model list). It speaks awsJson1_0: POST "/", Content-Type
+// application/x-amz-json-1.0, dispatched by the x-amz-target header, with a
+// bearer token. Usage is profile-scoped, so the region comes from the profile ARN.
 const (
-	usageLimitsPath   = "/getUsageLimits"
+	// usageLimitsTarget is the awsJson x-amz-target that dispatches the operation;
+	// the POST itself is to the root path "/" per the awsJson1_0 protocol.
 	usageLimitsTarget = "AmazonCodeWhispererService.GetUsageLimits"
+
+	// codeWhispererHostTemplate is the AWS Q data-plane endpoint that serves the
+	// non-streaming AmazonCodeWhispererService operations (GetUsageLimits, GetProfile).
+	codeWhispererHostTemplate = "https://q.%s.amazonaws.com"
+
+	// usageResourceType is the credit pool requested. Kiro's IDE sends this exact
+	// value; the returned breakdown entry is itself labelled resourceType "CREDIT".
+	usageResourceType = "AGENTIC_REQUEST"
 )
 
 // creditUsageKeys are the (lower-cased) object keys searched, in priority order,
@@ -130,8 +144,8 @@ type Limits struct {
 
 // limit-field key sets (lower-cased), searched case-insensitively.
 var (
-	totalCreditKeys     = []string{"totalcredits", "total", "creditlimit", "limit", "quota", "maxcredits", "creditquota"}
-	usedCreditKeys      = []string{"usedcredits", "used", "creditsused", "credits_used", "consumed", "consumedcredits", "usage"}
+	totalCreditKeys     = []string{"totalcredits", "total", "creditlimit", "limit", "quota", "maxcredits", "creditquota", "usagelimit"}
+	usedCreditKeys      = []string{"usedcredits", "used", "creditsused", "credits_used", "consumed", "consumedcredits", "usage", "currentusage"}
 	remainingCreditKeys = []string{"remainingcredits", "remaining", "available", "availablecredits", "creditsremaining", "balance"}
 )
 
@@ -145,19 +159,22 @@ type authManager interface {
 	ProfileARN() string
 }
 
-// FetchLimits performs a best-effort, non-streaming call to Kiro's usage-limits
-// endpoint at am.QHost() and returns the account's credit balance.
+// FetchLimits performs the non-streaming awsJson1_0 GetUsageLimits call against
+// the AWS Q data-plane endpoint for the profile's home region and returns the
+// account's credit balance.
 //
-// It builds the standard Kiro headers via util.KiroHeaders, overrides the
-// x-amz-target for the usage-limits operation, and ALWAYS includes the account's
-// profileArn in the request body (Kiro rejects credit/quota calls without it).
-// When hc is nil a 30s-timeout client is used. clientVersion is the spoofed Kiro
-// IDE version for the User-Agent.
+// It mirrors Kiro's CodeWhispererRuntimeClient: POST "/" with an x-amz-target
+// header, Content-Type application/x-amz-json-1.0 and a body of {origin,
+// profileArn, resourceType}, reusing util.KiroHeaders (which already sets the
+// bearer token, content-type and user-agent) and overriding only the target,
+// which otherwise names the streaming op. The region is derived from the profile
+// ARN because usage is profile-scoped. When hc is nil a 30s-timeout client is
+// used; clientVersion is the spoofed Kiro IDE version for the User-Agent.
 //
-// Because the upstream contract is undocumented, FetchLimits returns a clear
-// error on transport failure, a non-2xx status, an unparseable body, or a
-// response whose shape carries no recognizable credit fields. On the last case
-// the returned Limits still carries Raw so the route may inspect or forward it.
+// FetchLimits stays defensive: it returns a clear error on transport failure, a
+// non-2xx status, an unparseable body, or a response whose shape carries no
+// recognizable credit fields. In the last case the returned Limits still carries
+// Raw so the route may inspect or forward it.
 func FetchLimits(ctx context.Context, am authManager, hc *http.Client, clientVersion string) (Limits, error) {
 	if am == nil {
 		return Limits{}, fmt.Errorf("usage: auth manager is nil")
@@ -167,27 +184,26 @@ func FetchLimits(ctx context.Context, am authManager, hc *http.Client, clientVer
 		return Limits{}, fmt.Errorf("usage: failed to get access token: %w", err)
 	}
 
-	url := strings.TrimRight(am.QHost(), "/") + usageLimitsPath
-
-	headers := util.KiroHeaders(token, am.Fingerprint(), clientVersion)
-	// KiroHeaders targets the streaming GenerateAssistantResponse operation;
-	// override it for the usage-limits call.
-	headers["x-amz-target"] = usageLimitsTarget
-
-	// ALWAYS include profileArn (Kiro associates usage/quota with the profile).
-	reqBody := map[string]any{"profileArn": am.ProfileARN()}
-	buf, err := json.Marshal(reqBody)
+	reqBody, err := json.Marshal(map[string]any{
+		"origin":       "AI_EDITOR",
+		"profileArn":   am.ProfileARN(),
+		"resourceType": usageResourceType,
+	})
 	if err != nil {
 		return Limits{}, fmt.Errorf("usage: failed to encode request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(buf))
+	// awsJson1_0: POST to the root path, dispatched by x-amz-target. Reuse the
+	// standard Kiro headers (bearer token, content-type, user-agent) and override
+	// only the target, which otherwise names the streaming op.
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, usageHost(am)+"/", bytes.NewReader(reqBody))
 	if err != nil {
 		return Limits{}, fmt.Errorf("usage: failed to build request: %w", err)
 	}
-	for k, v := range headers {
+	for k, v := range util.KiroHeaders(token, am.Fingerprint(), clientVersion) {
 		req.Header.Set(k, v)
 	}
+	req.Header.Set("x-amz-target", usageLimitsTarget)
 
 	client := hc
 	if client == nil {
@@ -210,15 +226,84 @@ func FetchLimits(ctx context.Context, am authManager, hc *http.Client, clientVer
 
 	var parsed map[string]any
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return Limits{}, fmt.Errorf("usage: could not parse usage-limits response (assumptions about the endpoint may be wrong): %w", err)
+		return Limits{}, fmt.Errorf("usage: could not parse usage-limits response: %w", err)
 	}
 
 	lim, found := extractLimits(parsed)
 	lim.Raw = parsed
 	if !found {
-		return lim, fmt.Errorf("usage: usage-limits response had no recognizable credit fields (endpoint/shape assumptions may be wrong)")
+		return lim, fmt.Errorf("usage: usage-limits response had no recognizable credit fields")
 	}
 	return lim, nil
+}
+
+// regionRe validates an AWS region token (e.g. eu-central-1) parsed from an ARN.
+var regionRe = regexp.MustCompile(`^[a-z]{2}-[a-z]+-\d+$`)
+
+// usageHost returns the AWS Q data-plane endpoint for the usage-limits call,
+// pinned to the profile's home region (parsed from the ARN:
+// arn:aws:codewhisperer:REGION:account:profile/id). Usage is profile-scoped, so
+// this must be the profile's region rather than the globally-configured
+// KIRO_REGION. Falls back to us-east-1 (the SDK default) when the ARN carries no
+// parseable region.
+func usageHost(am authManager) string {
+	region := "us-east-1"
+	if parts := strings.Split(am.ProfileARN(), ":"); len(parts) >= 4 && regionRe.MatchString(parts[3]) {
+		region = parts[3]
+	}
+	return fmt.Sprintf(codeWhispererHostTemplate, region)
+}
+
+// limitsFromBreakdown reads Kiro's documented usage shape: a usageBreakdownList
+// array whose entries carry currentUsage/usageLimit per resourceType. It prefers
+// the AGENTIC_REQUEST pool (the credit balance) and otherwise takes the first
+// entry that reports either figure.
+func limitsFromBreakdown(m map[string]any) (Limits, bool) {
+	var raw any
+	for k, v := range m {
+		if strings.EqualFold(k, "usageBreakdownList") {
+			raw = v
+			break
+		}
+	}
+	list, ok := raw.([]any)
+	if !ok || len(list) == 0 {
+		return Limits{}, false
+	}
+
+	pick := func(want string) (limit, used float64, ok bool) {
+		for _, item := range list {
+			entry, isMap := item.(map[string]any)
+			if !isMap {
+				continue
+			}
+			lower := lowerKeys(entry)
+			if want != "" {
+				rt, _ := lower["resourcetype"].(string)
+				if !strings.EqualFold(rt, want) {
+					continue
+				}
+			}
+			limit, lOK := findFloat(lower, []string{"usagelimit"})
+			used, uOK := findFloat(lower, []string{"currentusage"})
+			if lOK || uOK {
+				return limit, used, true
+			}
+		}
+		return 0, 0, false
+	}
+
+	limit, used, ok := pick("CREDIT")
+	if !ok {
+		limit, used, ok = pick(usageResourceType)
+	}
+	if !ok {
+		limit, used, ok = pick("")
+	}
+	if !ok {
+		return Limits{}, false
+	}
+	return Limits{TotalCredits: limit, UsedCredits: used, RemainingCredits: limit - used}, true
 }
 
 // extractLimits pulls total/used/remaining credits out of a decoded usage-limits
@@ -226,6 +311,11 @@ func FetchLimits(ctx context.Context, am authManager, hc *http.Client, clientVer
 // (Kiro may wrap the figures under a container key). Missing values are derived
 // arithmetically when the other two are present.
 func extractLimits(m map[string]any) (Limits, bool) {
+	// Preferred: Kiro's documented usageBreakdownList shape.
+	if lim, ok := limitsFromBreakdown(m); ok {
+		return lim, true
+	}
+
 	lower := lowerKeys(m)
 	total, tOK := findFloat(lower, totalCreditKeys)
 	used, uOK := findFloat(lower, usedCreditKeys)
