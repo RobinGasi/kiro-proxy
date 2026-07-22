@@ -5,8 +5,8 @@
 // package measures the serialized size of an outgoing Kiro payload and, when it
 // exceeds the configured limit (config.KiroMaxPayloadBytes), either reports a
 // clear error or — when auto-trimming is enabled (config.AutoTrimPayload) —
-// progressively reduces the payload via history trimming, head/tail content
-// truncation, history clearing, and image stripping.
+// progressively reduces the payload via oversized-image shrinking, history
+// trimming, head/tail content truncation, history clearing, and image stripping.
 //
 // It operates on the same in-memory representation used elsewhere for the Kiro
 // payload: a map[string]any decoded from / destined for JSON. Maps are mutated
@@ -83,8 +83,8 @@ func CheckPayloadSize(payload map[string]any) (int, error) {
 //   - If it exceeds the limit and autoTrim is false, the payload is left
 //     untouched and a *PayloadTooLargeError is returned.
 //   - If it exceeds the limit and autoTrim is true, progressively reduces the
-//     payload: oldest history pairs, inline content truncation, history clear,
-//     and image stripping via [enforceLimit].
+//     payload: oversized images, oldest history pairs, inline content
+//     truncation, history clear, and image stripping via [enforceLimit].
 //
 // Callers pass config.KiroMaxPayloadBytes and config.AutoTrimPayload.
 func Guard(payload map[string]any, maxBytes int, autoTrim bool) (TrimStats, error) {
@@ -254,85 +254,112 @@ func repairOrphanedToolResults(history []any) {
 		if !ok {
 			continue
 		}
-		ctx, ok := userMsg["userInputMessageContext"].(map[string]any)
+		repairToolResultsInUserMessage(userMsg, toolUseIDsAt(history, i-1))
+	}
+}
+
+// repairOrphanedCurrentToolResults repairs tool results on currentMessage after
+// payload trimming has removed their immediately preceding assistant history.
+func repairOrphanedCurrentToolResults(payload map[string]any) {
+	cs, ok := payload["conversationState"].(map[string]any)
+	if !ok {
+		return
+	}
+	current, ok := cs["currentMessage"].(map[string]any)
+	if !ok {
+		return
+	}
+	userMsg, ok := current["userInputMessage"].(map[string]any)
+	if !ok {
+		return
+	}
+	history, _ := cs["history"].([]any)
+	repairToolResultsInUserMessage(userMsg, toolUseIDsAt(history, len(history)-1))
+}
+
+func toolUseIDsAt(history []any, index int) map[string]struct{} {
+	validIDs := map[string]struct{}{}
+	if index < 0 || index >= len(history) {
+		return validIDs
+	}
+	entry, ok := history[index].(map[string]any)
+	if !ok {
+		return validIDs
+	}
+	assistant, ok := entry["assistantResponseMessage"].(map[string]any)
+	if !ok {
+		return validIDs
+	}
+	toolUses, ok := assistant["toolUses"].([]any)
+	if !ok {
+		return validIDs
+	}
+	for _, toolUse := range toolUses {
+		toolUseMap, ok := toolUse.(map[string]any)
 		if !ok {
 			continue
 		}
-		raw, has := ctx["toolResults"]
-		if !has {
-			continue
+		if id, ok := toolUseMap["toolUseId"].(string); ok && id != "" {
+			validIDs[id] = struct{}{}
 		}
-		toolResults, ok := raw.([]any)
+	}
+	return validIDs
+}
+
+func repairToolResultsInUserMessage(userMsg map[string]any, validIDs map[string]struct{}) {
+	ctx, ok := userMsg["userInputMessageContext"].(map[string]any)
+	if !ok {
+		return
+	}
+	toolResults, ok := ctx["toolResults"].([]any)
+	if !ok {
+		return
+	}
+
+	kept := make([]any, 0, len(toolResults))
+	var orphanedText []string
+	for _, toolResult := range toolResults {
+		toolResultMap, ok := toolResult.(map[string]any)
 		if !ok {
 			continue
 		}
-
-		// Collect valid toolUseIds from the preceding assistant message.
-		validIDs := map[string]struct{}{}
-		if i > 0 {
-			if prev, ok := history[i-1].(map[string]any); ok {
-				if assistant, ok := prev["assistantResponseMessage"].(map[string]any); ok {
-					if tus, ok := assistant["toolUses"].([]any); ok {
-						for _, t := range tus {
-							tu, ok := t.(map[string]any)
-							if !ok {
-								continue
-							}
-							if id, ok := tu["toolUseId"].(string); ok && id != "" {
-								validIDs[id] = struct{}{}
-							}
-						}
-					}
-				}
-			}
-		}
-
-		kept := make([]any, 0, len(toolResults))
-		var orphanedText []string
-		for _, tr := range toolResults {
-			trMap, ok := tr.(map[string]any)
-			if !ok {
-				continue
-			}
-			id, _ := trMap["toolUseId"].(string)
-			if _, valid := validIDs[id]; valid {
-				kept = append(kept, tr)
-				continue
-			}
-			// Orphaned: preserve any text content.
-			switch content := trMap["content"].(type) {
-			case []any:
-				for _, part := range content {
-					if pm, ok := part.(map[string]any); ok {
-						if txt, ok := pm["text"].(string); ok && txt != "" {
-							orphanedText = append(orphanedText, txt)
-						}
-					}
-				}
-			case string:
-				if content != "" {
-					orphanedText = append(orphanedText, content)
-				}
-			}
-		}
-
-		if len(kept) == len(toolResults) {
+		id, _ := toolResultMap["toolUseId"].(string)
+		if _, valid := validIDs[id]; valid {
+			kept = append(kept, toolResult)
 			continue
 		}
 
-		if len(kept) > 0 {
-			ctx["toolResults"] = kept
-		} else {
-			delete(ctx, "toolResults")
-			if len(ctx) == 0 {
-				delete(userMsg, "userInputMessageContext")
+		// Orphaned: preserve any text content.
+		switch content := toolResultMap["content"].(type) {
+		case []any:
+			for _, part := range content {
+				if partMap, ok := part.(map[string]any); ok {
+					if text, ok := partMap["text"].(string); ok && text != "" {
+						orphanedText = append(orphanedText, text)
+					}
+				}
+			}
+		case string:
+			if content != "" {
+				orphanedText = append(orphanedText, content)
 			}
 		}
+	}
 
-		if len(orphanedText) > 0 {
-			marker := "\n[trimmed tool result] " + strings.Join(orphanedText, "; ")
-			current, _ := userMsg["content"].(string)
-			userMsg["content"] = current + marker
+	if len(kept) == len(toolResults) {
+		return
+	}
+	if len(kept) > 0 {
+		ctx["toolResults"] = kept
+	} else {
+		delete(ctx, "toolResults")
+		if len(ctx) == 0 {
+			delete(userMsg, "userInputMessageContext")
 		}
+	}
+	if len(orphanedText) > 0 {
+		marker := "\n[trimmed tool result] " + strings.Join(orphanedText, "; ")
+		current, _ := userMsg["content"].(string)
+		userMsg["content"] = current + marker
 	}
 }

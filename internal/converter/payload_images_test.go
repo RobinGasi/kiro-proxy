@@ -80,3 +80,66 @@ func TestBuildKiroPayloadShrinksOversizedImage(t *testing.T) {
 		t.Fatal("unexpected image-removed note when the image survived")
 	}
 }
+
+// TestBuildKiroPayloadPreservesToolHistoryWhenShrinkingOversizedImage guards
+// the Claude Code image-read path: shrinking a large tool-result image must not
+// discard the preceding tool_use and the rest of the conversation history.
+func TestBuildKiroPayloadPreservesToolHistoryWhenShrinkingOversizedImage(t *testing.T) {
+	imgData := noisyPNGBase64(t, 800, 800)
+	req := Request{
+		Model: "claude-sonnet-4",
+		Messages: []Message{
+			{
+				Role:    "user",
+				Content: []ContentPart{{Type: "text", Text: "Render and review the wallpaper"}},
+			},
+			{
+				Role:    "assistant",
+				Content: []ContentPart{{Type: "text", Text: "The wallpaper has been generated"}},
+			},
+			{
+				Role:    "user",
+				Content: []ContentPart{{Type: "text", Text: "Check that it is dark and low contrast"}},
+			},
+			{
+				Role:    "assistant",
+				Content: []ContentPart{{Type: "text", Text: "Let me view it"}},
+				ToolCalls: []ToolCall{{
+					ID:       "toolu_read",
+					Function: FunctionCall{Name: "Read", Arguments: map[string]any{"file_path": "wallpaper.png"}},
+				}},
+			},
+			{
+				Role:        "user",
+				ToolResults: []ToolResult{{ToolUseID: "toolu_read", Content: "image contents"}},
+				Images:      []Image{{MediaType: "image/png", Data: imgData}},
+			},
+		},
+		Tools: []Tool{{
+			Name:        "Read",
+			Description: "Read a file",
+			InputSchema: map[string]any{"type": "object"},
+		}},
+	}
+
+	cfg := &config.Config{KiroMaxPayloadBytes: 600_000, AutoTrimPayload: true}
+	body, _, err := BuildKiroPayload(context.Background(), cfg, req, "", "kiro-model")
+	if err != nil {
+		t.Fatalf("BuildKiroPayload: %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	conversation := payload["conversationState"].(map[string]any)
+	history, ok := conversation["history"].([]any)
+	if !ok || len(history) != 4 {
+		t.Fatalf("conversation history was cleared while shrinking the image: %+v", history)
+	}
+	assistant := history[3].(map[string]any)["assistantResponseMessage"].(map[string]any)
+	toolUses, ok := assistant["toolUses"].([]any)
+	if !ok || len(toolUses) != 1 || toolUses[0].(map[string]any)["toolUseId"] != "toolu_read" {
+		t.Fatalf("preceding tool_use was not preserved: %+v", assistant)
+	}
+}

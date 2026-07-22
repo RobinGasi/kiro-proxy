@@ -34,7 +34,32 @@ func enforceLimit(payload map[string]any, maxBytes int) (TrimStats, error) {
 		return stats, nil
 	}
 
-	// Phase 1: drop oldest history pairs.
+	// Phase 1: shrink any single image that is larger than the entire payload
+	// budget before sacrificing conversation history. Image-reading tools commonly
+	// attach multi-megabyte PNGs that can be re-encoded below the limit while all
+	// surrounding context remains intact.
+	for range 32 {
+		size, err := CheckPayloadSize(payload)
+		if err != nil {
+			return TrimStats{}, err
+		}
+		if size <= maxBytes {
+			stats.FinalBytes = size
+			stats.FinalEntries = historyEntries(payload)
+			return stats, nil
+		}
+		_, source := largestImage(payload)
+		if source == nil {
+			break
+		}
+		imageData, _ := source["bytes"].(string)
+		if len(imageData) <= maxBytes || !shrinkLargestImage(payload, size-maxBytes) {
+			break
+		}
+		stats.ImagesShrunk = true
+	}
+
+	// Phase 2: drop oldest history pairs.
 	trimStats, err := TrimPayloadToLimit(payload, maxBytes)
 	if err != nil {
 		return TrimStats{}, err
@@ -48,7 +73,8 @@ func enforceLimit(payload map[string]any, maxBytes int) (TrimStats, error) {
 		return stats, nil
 	}
 
-	// Phase 2–4: shrink inline content, clear history, strip images.
+	// Phase 3–6: shrink inline content and images before clearing history, then
+	// strip images only as the final fallback.
 	for range 32 {
 		size, err := CheckPayloadSize(payload)
 		if err != nil {
@@ -65,13 +91,13 @@ func enforceLimit(payload map[string]any, maxBytes int) (TrimStats, error) {
 			stats.ContentTruncated = true
 			continue
 		}
+		if shrunk := shrinkLargestImage(payload, excess); shrunk {
+			stats.ImagesShrunk = true
+			continue
+		}
 		if cleared := clearAllHistory(payload); cleared {
 			stats.HistoryCleared = true
 			stats.FinalEntries = historyEntries(payload)
-			continue
-		}
-		if shrunk := shrinkLargestImage(payload, excess); shrunk {
-			stats.ImagesShrunk = true
 			continue
 		}
 		if stripped := stripAllImages(payload); stripped {
@@ -291,6 +317,7 @@ func clearAllHistory(payload map[string]any) bool {
 		return false
 	}
 	delete(cs, "history")
+	repairOrphanedCurrentToolResults(payload)
 	return true
 }
 

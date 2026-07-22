@@ -102,6 +102,58 @@ func TestClearAllHistory(t *testing.T) {
 	}
 }
 
+func TestEnforceLimitRepairsCurrentToolResultAfterClearingHistory(t *testing.T) {
+	p := map[string]any{
+		"conversationState": map[string]any{
+			"history": []any{
+				map[string]any{"userInputMessage": map[string]any{"content": "open the image"}},
+				map[string]any{"assistantResponseMessage": map[string]any{
+					"content": "reading image",
+					"toolUses": []any{map[string]any{
+						"toolUseId": "toolu_read",
+						"name":      "Read",
+						"input":     map[string]any{"file_path": "wallpaper.png"},
+					}},
+				}},
+			},
+			"currentMessage": map[string]any{
+				"userInputMessage": map[string]any{
+					"content": "tool result",
+					"userInputMessageContext": map[string]any{
+						"toolResults": []any{map[string]any{
+							"toolUseId": "toolu_read",
+							"content":   []any{map[string]any{"text": "image contents"}},
+						}},
+					},
+					"images": []any{map[string]any{
+						"format": "png",
+						"source": map[string]any{"bytes": strings.Repeat("invalid-image-data", 1_000)},
+					}},
+				},
+			},
+		},
+	}
+
+	stats, err := enforceLimit(p, 1_000)
+	if err != nil {
+		t.Fatalf("enforceLimit: %v", err)
+	}
+	if !stats.HistoryCleared {
+		t.Fatalf("expected history to be cleared, stats=%+v", stats)
+	}
+
+	cs := p["conversationState"].(map[string]any)
+	current := cs["currentMessage"].(map[string]any)["userInputMessage"].(map[string]any)
+	if ctx, ok := current["userInputMessageContext"].(map[string]any); ok {
+		if _, hasToolResults := ctx["toolResults"]; hasToolResults {
+			t.Fatal("current tool_result was left orphaned after its tool_use history was cleared")
+		}
+	}
+	if content := current["content"].(string); !strings.Contains(content, "image contents") {
+		t.Fatalf("orphaned tool_result content was not preserved: %q", content)
+	}
+}
+
 func TestStripAllImages(t *testing.T) {
 	p := map[string]any{
 		"conversationState": map[string]any{

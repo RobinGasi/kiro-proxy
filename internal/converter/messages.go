@@ -65,9 +65,10 @@ func stripAllToolContent(messages []Message) ([]Message, bool) {
 	return result, had
 }
 
-// ensureAssistantBeforeToolResults converts orphaned tool results (those without
-// a preceding assistant message carrying tool calls) into text appended to the
-// message content. The boolean reports whether any tool results were converted.
+// ensureAssistantBeforeToolResults converts orphaned tool results (those whose
+// tool-use ID is not present in the immediately preceding assistant message)
+// into text appended to the message content. The boolean reports whether any
+// tool results were converted.
 func ensureAssistantBeforeToolResults(messages []Message) ([]Message, bool) {
 	if len(messages) == 0 {
 		return nil, false
@@ -78,15 +79,36 @@ func ensureAssistantBeforeToolResults(messages []Message) ([]Message, bool) {
 
 	for _, msg := range messages {
 		if len(msg.ToolResults) > 0 {
-			hasPrecedingAssistant := len(result) > 0 &&
-				result[len(result)-1].Role == "assistant" &&
-				len(result[len(result)-1].ToolCalls) > 0
+			validToolUseIDs := make(map[string]struct{})
+			if len(result) > 0 && result[len(result)-1].Role == "assistant" {
+				previous := result[len(result)-1]
+				for _, call := range previous.ToolCalls {
+					if call.ID != "" {
+						validToolUseIDs[call.ID] = struct{}{}
+					}
+				}
+				for _, part := range previous.Content {
+					if part.Type == "tool_use" && part.ID != "" {
+						validToolUseIDs[part.ID] = struct{}{}
+					}
+				}
+			}
 
-			if !hasPrecedingAssistant {
+			validResults := make([]ToolResult, 0, len(msg.ToolResults))
+			orphanedResults := make([]ToolResult, 0, len(msg.ToolResults))
+			for _, toolResult := range msg.ToolResults {
+				if _, valid := validToolUseIDs[toolResult.ToolUseID]; valid {
+					validResults = append(validResults, toolResult)
+				} else {
+					orphanedResults = append(orphanedResults, toolResult)
+				}
+			}
+
+			if len(orphanedResults) > 0 {
 				slog.Debug("converting orphaned tool_results to text",
-					"count", len(msg.ToolResults))
+					"count", len(orphanedResults), "kept", len(validResults))
 
-				resultsText := toolResultsToText(msg.ToolResults)
+				resultsText := toolResultsToText(orphanedResults)
 				original := ExtractTextContent(msg.Content)
 
 				var newContent string
@@ -100,10 +122,11 @@ func ensureAssistantBeforeToolResults(messages []Message) ([]Message, bool) {
 				}
 
 				result = append(result, Message{
-					Role:      msg.Role,
-					Content:   textContent(newContent),
-					ToolCalls: msg.ToolCalls,
-					Images:    msg.Images,
+					Role:        msg.Role,
+					Content:     textContent(newContent),
+					ToolCalls:   msg.ToolCalls,
+					ToolResults: validResults,
+					Images:      msg.Images,
 				})
 				convertedAny = true
 				continue
