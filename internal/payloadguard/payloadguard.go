@@ -3,14 +3,22 @@
 // The Kiro API rejects request bodies larger than ~615KB with a misleading
 // "Improperly formed request." (reason: null) error. To avoid that, this
 // package measures the serialized size of an outgoing Kiro payload and, when it
-// exceeds the configured limit (config.KiroMaxPayloadBytes), either reports a
-// clear error or — when auto-trimming is enabled (config.AutoTrimPayload) —
-// progressively reduces the payload via oversized-image shrinking, history
-// trimming, head/tail content truncation, history clearing, and image stripping.
+// exceeds the configured limit (config.KiroMaxPayloadBytes), reduces it in two
+// tiers:
+//
+//   - Always: shrink oversized images by downscaling/re-encoding them. This is
+//     non-destructive to conversation context, so it runs regardless of the
+//     auto-trim setting.
+//   - Only when auto-trimming is enabled (config.AutoTrimPayload): drop the
+//     oldest user/assistant history pairs until the payload fits. When
+//     auto-trim is disabled the payload is left intact and a clear
+//     *PayloadTooLargeError is returned so the client (and the model) stay in
+//     sync — the caller can surface "context too large, use /compact" rather
+//     than silently losing history.
 //
 // It operates on the same in-memory representation used elsewhere for the Kiro
 // payload: a map[string]any decoded from / destined for JSON. Maps are mutated
-// in place, so trimming is reflected in the caller's payload.
+// in place, so any reduction is reflected in the caller's payload.
 package payloadguard
 
 import (
@@ -31,15 +39,10 @@ type TrimStats struct {
 	FinalEntries int
 	// Trimmed reports whether any history entries were removed.
 	Trimmed bool
-	// ContentTruncated reports whether inline text (messages, tool results) was shortened.
-	ContentTruncated bool
-	// HistoryCleared reports whether all history was dropped as a last resort.
-	HistoryCleared bool
 	// ImagesShrunk reports whether any image attachment was downscaled/re-encoded
-	// to fit the limit (preferred over dropping it).
+	// to fit the limit. This is non-destructive to conversation context and runs
+	// regardless of the auto-trim setting.
 	ImagesShrunk bool
-	// ImagesStripped reports whether image attachments were removed to save space.
-	ImagesStripped bool
 }
 
 // PayloadTooLargeError is returned by [Guard] when a payload exceeds the
@@ -80,37 +83,67 @@ func CheckPayloadSize(payload map[string]any) (int, error) {
 //
 //   - If the payload is within the limit, it is left untouched and stats with
 //     Trimmed=false are returned.
-//   - If it exceeds the limit and autoTrim is false, the payload is left
-//     untouched and a *PayloadTooLargeError is returned.
-//   - If it exceeds the limit and autoTrim is true, progressively reduces the
-//     payload: oversized images, oldest history pairs, inline content
-//     truncation, history clear, and image stripping via [enforceLimit].
+//   - Otherwise it first shrinks oversized images (non-destructive; always
+//     applied). If that brings the payload under the limit, the shrunk payload
+//     is returned with ImagesShrunk=true.
+//   - If it still exceeds the limit and autoTrim is true, the oldest
+//     user/assistant history pairs are dropped until it fits (or only two
+//     entries remain).
+//   - If it still exceeds the limit and autoTrim is false, the payload is left
+//     as-is (images already shrunk) and a *PayloadTooLargeError is returned so
+//     the caller can tell the client the context is too large.
 //
 // Callers pass config.KiroMaxPayloadBytes and config.AutoTrimPayload.
 func Guard(payload map[string]any, maxBytes int, autoTrim bool) (TrimStats, error) {
-	size, err := CheckPayloadSize(payload)
+	originalBytes, err := CheckPayloadSize(payload)
 	if err != nil {
 		return TrimStats{}, err
 	}
 
-	entries := historyEntries(payload)
-	noop := TrimStats{
-		OriginalBytes:   size,
-		FinalBytes:      size,
-		OriginalEntries: entries,
-		FinalEntries:    entries,
-		Trimmed:         false,
+	originalEntries := historyEntries(payload)
+	stats := TrimStats{
+		OriginalBytes:   originalBytes,
+		FinalBytes:      originalBytes,
+		OriginalEntries: originalEntries,
+		FinalEntries:    originalEntries,
 	}
 
+	if originalBytes <= maxBytes {
+		return stats, nil
+	}
+
+	// Tier 1 (always): shrink oversized images. Keeps all conversation context.
+	// shrinkImagesToFit reports the final serialized size, so no re-measure here.
+	shrunk, size, err := shrinkImagesToFit(payload, maxBytes)
+	if err != nil {
+		return TrimStats{}, err
+	}
+	stats.ImagesShrunk = shrunk
+	stats.FinalBytes = size
+	stats.FinalEntries = historyEntries(payload)
 	if size <= maxBytes {
-		return noop, nil
+		return stats, nil
 	}
 
+	// Tier 2 (opt-in): drop oldest history pairs. Destructive to context, so
+	// gated behind autoTrim; otherwise report the payload as too large.
 	if !autoTrim {
-		return noop, &PayloadTooLargeError{Size: size, MaxBytes: maxBytes}
+		return stats, &PayloadTooLargeError{Size: size, MaxBytes: maxBytes}
 	}
 
-	return enforceLimit(payload, maxBytes)
+	trimStats, err := TrimPayloadToLimit(payload, maxBytes)
+	if err != nil {
+		return TrimStats{}, err
+	}
+	stats.Trimmed = trimStats.Trimmed
+	stats.FinalBytes = trimStats.FinalBytes
+	stats.FinalEntries = trimStats.FinalEntries
+
+	// TrimPayloadToLimit already reported the post-trim size; no re-measure.
+	if stats.FinalBytes > maxBytes {
+		return stats, &PayloadTooLargeError{Size: stats.FinalBytes, MaxBytes: maxBytes}
+	}
+	return stats, nil
 }
 
 // TrimPayloadToLimit trims the oldest conversation-history entries so the
@@ -256,25 +289,6 @@ func repairOrphanedToolResults(history []any) {
 		}
 		repairToolResultsInUserMessage(userMsg, toolUseIDsAt(history, i-1))
 	}
-}
-
-// repairOrphanedCurrentToolResults repairs tool results on currentMessage after
-// payload trimming has removed their immediately preceding assistant history.
-func repairOrphanedCurrentToolResults(payload map[string]any) {
-	cs, ok := payload["conversationState"].(map[string]any)
-	if !ok {
-		return
-	}
-	current, ok := cs["currentMessage"].(map[string]any)
-	if !ok {
-		return
-	}
-	userMsg, ok := current["userInputMessage"].(map[string]any)
-	if !ok {
-		return
-	}
-	history, _ := cs["history"].([]any)
-	repairToolResultsInUserMessage(userMsg, toolUseIDsAt(history, len(history)-1))
 }
 
 func toolUseIDsAt(history []any, index int) map[string]struct{} {

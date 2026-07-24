@@ -18,11 +18,6 @@ import (
 // there are no messages to send.
 var ErrNoMessages = errors.New("no messages to send")
 
-// imageStrippedNote is appended to the current message when an attached image
-// was too large to send to Kiro even after downscaling, so the dropped image is
-// visible in the model's reply rather than silently missing.
-const imageStrippedNote = "\n\n[kiro-proxy: an attached image was too large to send and was removed from this request]"
-
 // BuildKiroPayload assembles the Kiro / CodeWhisperer conversationState request
 // body from a unified [Request] and serializes it to JSON.
 //
@@ -184,24 +179,12 @@ func BuildKiroPayload(ctx context.Context, cfg *config.Config, in Request, profi
 	if err != nil {
 		return nil, nil, err
 	}
-	if stats.Trimmed || stats.ContentTruncated || stats.HistoryCleared || stats.ImagesShrunk || stats.ImagesStripped {
+	if stats.Trimmed || stats.ImagesShrunk {
 		slog.Info("reduced payload for Kiro API limit",
 			"original_entries", stats.OriginalEntries, "final_entries", stats.FinalEntries,
 			"original_bytes", stats.OriginalBytes, "final_bytes", stats.FinalBytes,
 			"history_trimmed", stats.Trimmed,
-			"content_truncated", stats.ContentTruncated,
-			"history_cleared", stats.HistoryCleared,
-			"images_shrunk", stats.ImagesShrunk,
-			"images_stripped", stats.ImagesStripped)
-	}
-	// Auto-shrinking should keep images in the request; if one was still too large
-	// to send it is removed as a last resort. Surface that instead of dropping it
-	// silently: warn, and leave the model a note so the outcome is visible.
-	if stats.ImagesStripped {
-		slog.Warn("image too large for Kiro API even after shrinking; removed from request")
-		if c, ok := userInputMessage["content"].(string); ok {
-			userInputMessage["content"] = c + imageStrippedNote
-		}
+			"images_shrunk", stats.ImagesShrunk)
 	}
 
 	body, err := json.Marshal(payload)

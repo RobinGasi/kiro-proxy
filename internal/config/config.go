@@ -18,10 +18,19 @@ const (
 	KiroRefreshURLTemplate = "https://prod.%s.auth.desktop.kiro.dev/refreshToken"
 	// AWSSSOOIDCURLTemplate is the AWS SSO OIDC CreateToken endpoint (kiro-cli).
 	AWSSSOOIDCURLTemplate = "https://oidc.%s.amazonaws.com/token"
-	// KiroAPIHostTemplate is the runtime host for GenerateAssistantResponse.
-	KiroAPIHostTemplate = "https://runtime.%s.kiro.dev"
-	// KiroQHostTemplate is the runtime host for ListAvailableModels.
-	KiroQHostTemplate = "https://runtime.%s.kiro.dev"
+	// KiroAPIHostTemplate is the runtime host for GenerateAssistantResponse. This
+	// is the NATIVE AWS Q data-plane host that genuine Kiro IDE / kiro-cli use;
+	// it accepts much larger request bodies than the legacy runtime.%s.kiro.dev
+	// gateway (verified: an 879KB / 367k-token request succeeds here but is
+	// rejected by the legacy host at ~615KB). Override with KIRO_API_HOST to fall
+	// back to the legacy gateway (https://runtime.%s.kiro.dev) if ever needed.
+	KiroAPIHostTemplate = "https://q.%s.amazonaws.com"
+	// KiroQHostTemplate is the runtime host for ListAvailableModels. Uses the same
+	// native host; override with KIRO_Q_HOST.
+	KiroQHostTemplate = "https://q.%s.amazonaws.com"
+	// LegacyKiroHostTemplate is the previous default gateway, kept for reference
+	// and as the documented rollback value for KIRO_API_HOST / KIRO_Q_HOST.
+	LegacyKiroHostTemplate = "https://runtime.%s.kiro.dev"
 )
 
 // Application identity.
@@ -213,8 +222,14 @@ func Load() *Config {
 		FakeReasoningOpenTags:      []string{"<thinking>", "<think>", "<reasoning>", "<thought>"},
 		FakeReasoningInitialBuffer: getEnvInt("FAKE_REASONING_INITIAL_BUFFER_SIZE", 20),
 
-		KiroMaxPayloadBytes: getEnvInt("KIRO_MAX_PAYLOAD_BYTES", 600000),
-		AutoTrimPayload:     getEnvBool("AUTO_TRIM_PAYLOAD", true),
+		// 8MB comfortably fits a full 1M-token conversation (~4-5MB of JSON) on the
+		// native host, while still catching runaway payloads. The old 600000 default
+		// was sized for the legacy runtime.kiro.dev gateway's ~615KB body cap; the
+		// native host has no such limit (verified to 879KB / 367k tokens), so the
+		// guard is now a safety net rather than a routine trimmer. Lower it (and set
+		// KIRO_API_HOST to the legacy gateway) if you must run against the old host.
+		KiroMaxPayloadBytes: getEnvInt("KIRO_MAX_PAYLOAD_BYTES", 8_000_000),
+		AutoTrimPayload:     getEnvBool("AUTO_TRIM_PAYLOAD", false),
 
 		WebSearchEnabled: getEnvBool("WEB_SEARCH_ENABLED", true),
 
@@ -303,8 +318,29 @@ func normalizeEnum(v string, allowed []string, def string) string {
 // URL builders.
 func GetKiroRefreshURL(region string) string { return sprintfRegion(KiroRefreshURLTemplate, region) }
 func GetAWSSSOOIDCURL(region string) string  { return sprintfRegion(AWSSSOOIDCURLTemplate, region) }
-func GetKiroAPIHost(region string) string    { return sprintfRegion(KiroAPIHostTemplate, region) }
-func GetKiroQHost(region string) string      { return sprintfRegion(KiroQHostTemplate, region) }
+
+// GetKiroAPIHost resolves the GenerateAssistantResponse host. It defaults to the
+// native AWS Q host (KiroAPIHostTemplate, https://q.<region>.amazonaws.com), which
+// accepts far larger request bodies than the legacy gateway. Set KIRO_API_HOST to
+// override — e.g. the legacy rollback value https://runtime.%s.kiro.dev, or a
+// literal host without templating. A "%s" in the value is replaced with the
+// region; a trailing slash is trimmed since the request path is appended.
+func GetKiroAPIHost(region string) string {
+	if override := strings.TrimRight(getEnv("KIRO_API_HOST", ""), "/"); override != "" {
+		return sprintfRegion(override, region)
+	}
+	return sprintfRegion(KiroAPIHostTemplate, region)
+}
+
+// GetKiroQHost resolves the ListAvailableModels / MCP host. Defaults to the native
+// host (KiroQHostTemplate); KIRO_Q_HOST overrides it the same way GetKiroAPIHost
+// honors KIRO_API_HOST.
+func GetKiroQHost(region string) string {
+	if override := strings.TrimRight(getEnv("KIRO_Q_HOST", ""), "/"); override != "" {
+		return sprintfRegion(override, region)
+	}
+	return sprintfRegion(KiroQHostTemplate, region)
+}
 
 func sprintfRegion(tmpl, region string) string {
 	return strings.Replace(tmpl, "%s", region, 1)

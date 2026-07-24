@@ -73,7 +73,7 @@ func TestShrinkImageBytesUndecodable(t *testing.T) {
 	}
 }
 
-func TestEnforceLimitShrinksImageInsteadOfStripping(t *testing.T) {
+func TestGuardShrinksImageToFit(t *testing.T) {
 	raw := makeNoisyPNG(t, 800, 800) // base64 is well over the limit
 	p := imagePayload(t, raw)
 	limit := 600_000
@@ -81,15 +81,13 @@ func TestEnforceLimitShrinksImageInsteadOfStripping(t *testing.T) {
 		t.Fatalf("test image not large enough: %d", got)
 	}
 
-	stats, err := enforceLimit(p, limit)
+	// autoTrim=false: the image must still be shrunk (non-destructive tier).
+	stats, err := Guard(p, limit, false)
 	if err != nil {
-		t.Fatalf("enforceLimit: %v", err)
+		t.Fatalf("Guard: %v", err)
 	}
 	if !stats.ImagesShrunk {
 		t.Fatalf("expected ImagesShrunk, stats=%+v", stats)
-	}
-	if stats.ImagesStripped {
-		t.Fatalf("image should be shrunk, not stripped, stats=%+v", stats)
 	}
 	if got := mustSize(t, p); got > limit {
 		t.Fatalf("payload still %d bytes, limit %d", got, limit)

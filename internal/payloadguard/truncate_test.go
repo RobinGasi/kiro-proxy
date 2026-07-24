@@ -1,55 +1,64 @@
 package payloadguard
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
 
-func hugeToolResultPayload(toolText string) map[string]any {
-	return map[string]any{
-		"conversationState": map[string]any{
-			"history": []any{
-				map[string]any{
-					"assistantResponseMessage": map[string]any{"content": "called tool"},
-				},
-				map[string]any{
-					"userInputMessage": map[string]any{
-						"content": "result",
-						"userInputMessageContext": map[string]any{
-							"toolResults": []any{
-								map[string]any{
-									"toolUseId": "toolu_1",
-									"content":   []any{map[string]any{"text": toolText}},
-								},
-							},
-						},
-					},
-				},
-			},
-			"currentMessage": map[string]any{
-				"userInputMessage": map[string]any{"content": "continue"},
-			},
-		},
+// TestShrinkImagesToFitReducesImagePayload verifies the non-destructive tier:
+// an oversized image is shrunk until the payload fits, with no history touched.
+func TestShrinkImagesToFitReducesImagePayload(t *testing.T) {
+	raw := makeNoisyPNG(t, 800, 800) // base64 is well over the limit
+	p := imagePayload(t, raw)
+	limit := 600_000
+	if got := mustSize(t, p); got <= limit {
+		t.Fatalf("test image not large enough: %d", got)
+	}
+
+	shrunk, size, err := shrinkImagesToFit(p, limit)
+	if err != nil {
+		t.Fatalf("shrinkImagesToFit: %v", err)
+	}
+	if !shrunk {
+		t.Fatal("expected an image to be shrunk")
+	}
+	if size > limit {
+		t.Fatalf("reported size %d exceeds limit %d", size, limit)
+	}
+	if got := mustSize(t, p); got != size {
+		t.Fatalf("reported size %d != actual serialized size %d", size, got)
 	}
 }
 
-func TestEnforceLimitTruncatesOversizedToolResult(t *testing.T) {
-	p := hugeToolResultPayload(strings.Repeat("x", 800_000))
+// TestGuardShrinksImagesWithoutAutoTrim verifies that image shrinking is applied
+// even when auto-trim is disabled — an oversized screenshot must not cost the
+// model its conversation history.
+func TestGuardShrinksImagesWithoutAutoTrim(t *testing.T) {
+	raw := makeNoisyPNG(t, 800, 800)
+	p := imagePayload(t, raw)
 	limit := 600_000
-
-	stats, err := enforceLimit(p, limit)
-	if err != nil {
-		t.Fatalf("enforceLimit: %v", err)
+	if got := mustSize(t, p); got <= limit {
+		t.Fatalf("test image not large enough: %d", got)
 	}
-	if !stats.ContentTruncated {
-		t.Fatalf("expected content truncation, stats=%+v", stats)
+
+	stats, err := Guard(p, limit, false)
+	if err != nil {
+		t.Fatalf("Guard should succeed by shrinking the image, got: %v", err)
+	}
+	if !stats.ImagesShrunk {
+		t.Fatalf("expected ImagesShrunk, stats=%+v", stats)
 	}
 	if got := mustSize(t, p); got > limit {
 		t.Fatalf("payload still %d bytes, limit %d", got, limit)
 	}
 }
 
-func TestEnforceLimitReducesHugeMixedPayload(t *testing.T) {
+// TestGuardRejectsOversizedTextWithoutAutoTrim is the core regression guard:
+// when a text-heavy conversation exceeds the limit and auto-trim is OFF, Guard
+// must return a PayloadTooLargeError and leave history INTACT rather than
+// silently dropping context.
+func TestGuardRejectsOversizedTextWithoutAutoTrim(t *testing.T) {
 	p := map[string]any{
 		"conversationState": map[string]any{
 			"history": []any{
@@ -57,165 +66,47 @@ func TestEnforceLimitReducesHugeMixedPayload(t *testing.T) {
 				map[string]any{"assistantResponseMessage": map[string]any{"content": strings.Repeat("b", 400_000)}},
 			},
 			"currentMessage": map[string]any{
-				"userInputMessage": map[string]any{
-					"content": "now",
-					"images": []any{
-						map[string]any{
-							"format": "png",
-							"source": map[string]any{"bytes": strings.Repeat("Z", 500_000)},
-						},
-					},
-				},
+				"userInputMessage": map[string]any{"content": "now"},
 			},
 		},
 	}
 	limit := 600_000
+	before := historyEntries(p)
 
-	stats, err := enforceLimit(p, limit)
-	if err != nil {
-		t.Fatalf("enforceLimit: %v", err)
+	stats, err := Guard(p, limit, false)
+	var tooLarge *PayloadTooLargeError
+	if err == nil {
+		t.Fatal("expected PayloadTooLargeError with auto-trim disabled")
 	}
-	if stats.FinalBytes >= stats.OriginalBytes {
-		t.Fatalf("expected payload reduction, stats=%+v", stats)
+	if !errors.As(err, &tooLarge) {
+		t.Fatalf("expected *PayloadTooLargeError, got %T: %v", err, err)
+	}
+	if stats.Trimmed {
+		t.Error("history must not be trimmed when auto-trim is disabled")
+	}
+	if after := historyEntries(p); after != before {
+		t.Errorf("history was mutated: before=%d after=%d", before, after)
+	}
+}
+
+// TestGuardTrimsOversizedTextWithAutoTrim verifies the opt-in destructive tier:
+// with auto-trim ON, oldest history pairs are dropped until the payload fits.
+func TestGuardTrimsOversizedTextWithAutoTrim(t *testing.T) {
+	p := makePayload(40)
+	full := mustSize(t, p)
+	limit := full / 2
+
+	stats, err := Guard(p, limit, true)
+	if err != nil {
+		t.Fatalf("Guard: %v", err)
+	}
+	if !stats.Trimmed {
+		t.Fatalf("expected trimming, stats=%+v", stats)
 	}
 	if got := mustSize(t, p); got > limit {
 		t.Fatalf("payload still %d bytes, limit %d", got, limit)
 	}
-}
-
-func TestClearAllHistory(t *testing.T) {
-	p := map[string]any{
-		"conversationState": map[string]any{
-			"history": []any{
-				map[string]any{"userInputMessage": map[string]any{"content": "old"}},
-			},
-		},
-	}
-	if !clearAllHistory(p) {
-		t.Fatal("expected history clear")
-	}
-	if got := historyEntries(p); got != 0 {
-		t.Fatalf("history entries=%d, want 0", got)
-	}
-	if clearAllHistory(p) {
-		t.Fatal("expected second clear to be a no-op")
-	}
-}
-
-func TestEnforceLimitRepairsCurrentToolResultAfterClearingHistory(t *testing.T) {
-	p := map[string]any{
-		"conversationState": map[string]any{
-			"history": []any{
-				map[string]any{"userInputMessage": map[string]any{"content": "open the image"}},
-				map[string]any{"assistantResponseMessage": map[string]any{
-					"content": "reading image",
-					"toolUses": []any{map[string]any{
-						"toolUseId": "toolu_read",
-						"name":      "Read",
-						"input":     map[string]any{"file_path": "wallpaper.png"},
-					}},
-				}},
-			},
-			"currentMessage": map[string]any{
-				"userInputMessage": map[string]any{
-					"content": "tool result",
-					"userInputMessageContext": map[string]any{
-						"toolResults": []any{map[string]any{
-							"toolUseId": "toolu_read",
-							"content":   []any{map[string]any{"text": "image contents"}},
-						}},
-					},
-					"images": []any{map[string]any{
-						"format": "png",
-						"source": map[string]any{"bytes": strings.Repeat("invalid-image-data", 1_000)},
-					}},
-				},
-			},
-		},
-	}
-
-	stats, err := enforceLimit(p, 1_000)
-	if err != nil {
-		t.Fatalf("enforceLimit: %v", err)
-	}
-	if !stats.HistoryCleared {
-		t.Fatalf("expected history to be cleared, stats=%+v", stats)
-	}
-
-	cs := p["conversationState"].(map[string]any)
-	current := cs["currentMessage"].(map[string]any)["userInputMessage"].(map[string]any)
-	if ctx, ok := current["userInputMessageContext"].(map[string]any); ok {
-		if _, hasToolResults := ctx["toolResults"]; hasToolResults {
-			t.Fatal("current tool_result was left orphaned after its tool_use history was cleared")
-		}
-	}
-	if content := current["content"].(string); !strings.Contains(content, "image contents") {
-		t.Fatalf("orphaned tool_result content was not preserved: %q", content)
-	}
-}
-
-func TestStripAllImages(t *testing.T) {
-	p := map[string]any{
-		"conversationState": map[string]any{
-			"currentMessage": map[string]any{
-				"userInputMessage": map[string]any{
-					"content": "hi",
-					"images": []any{
-						map[string]any{
-							"format": "png",
-							"source": map[string]any{"bytes": strings.Repeat("A", 500_000)},
-						},
-					},
-				},
-			},
-		},
-	}
-	before := mustSize(t, p)
-	if !stripAllImages(p) {
-		t.Fatal("expected images stripped")
-	}
-	after := mustSize(t, p)
-	if after >= before {
-		t.Fatalf("expected smaller payload after stripping images: before=%d after=%d", before, after)
-	}
-}
-
-func TestTruncateStringPreservesHeadAndTail(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name    string
-		input   string
-		maxLen  int
-		wantLen int
-	}{
-		{
-			name:    "noop under limit",
-			input:   "short",
-			maxLen:  100,
-			wantLen: 5,
-		},
-		{
-			name:    "head tail with marker",
-			input:   strings.Repeat("a", 50) + strings.Repeat("z", 50),
-			maxLen:  80,
-			wantLen: 80,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			got := truncateString(tc.input, tc.maxLen)
-			if len(got) != tc.wantLen {
-				t.Fatalf("len(got)=%d want %d", len(got), tc.wantLen)
-			}
-			if len(tc.input) <= tc.maxLen && got != tc.input {
-				t.Fatalf("expected unchanged input, got %q", got)
-			}
-			if len(tc.input) > tc.maxLen && !strings.Contains(got, truncationMarker) {
-				t.Fatalf("expected truncation marker in %q", got)
-			}
-		})
+	if stats.FinalEntries >= stats.OriginalEntries {
+		t.Fatalf("expected fewer entries: orig=%d final=%d", stats.OriginalEntries, stats.FinalEntries)
 	}
 }
