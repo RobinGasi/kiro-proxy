@@ -42,9 +42,11 @@ const (
 // ContextLimitFor returns the known input-context window (in tokens) for the
 // given model, falling back to def when the model is unrecognized.
 //
-// Claude Opus and Sonnet 4.x (and newer) expose a 1,000,000-token window;
-// Claude Haiku 4.5 exposes 200,000. Anything else — older Claude models or
-// non-Claude models — uses def (typically config.Config.DefaultMaxInputTokens).
+// Claude Opus and Sonnet 4.x (and newer), plus a bare "opus"/"sonnet" family
+// name (which denotes the latest of that family), expose a 1,000,000-token
+// window; Claude Haiku 4.5 exposes 200,000. Anything else — older versioned
+// Claude models or non-Claude models — uses def (typically
+// config.Config.DefaultMaxInputTokens).
 // The model id is normalized first (NormalizeModelName), so client suffixes such
 // as "[1m]", date stamps and "-latest" do not affect the result.
 func ContextLimitFor(modelID string, def int) int {
@@ -56,7 +58,13 @@ func ContextLimitFor(modelID string, def int) int {
 	major, minor := modelVersion(normalized)
 	switch family {
 	case "opus", "sonnet":
-		if major >= 4 {
+		// Opus/Sonnet 4.x and newer expose a 1M window. major==0 means the name
+		// carried no version — a bare family like "opus"/"sonnet", which denotes
+		// "the latest of this family" and is currently 1M too. Treat it as 1M
+		// rather than the unknown-model fallback. (This only matters when the model
+		// cache is unavailable; Resolver.Resolve normally expands a bare family to a
+		// concrete versioned id first.)
+		if major == 0 || major >= 4 {
 			return contextWindow1M
 		}
 	case "haiku":

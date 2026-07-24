@@ -79,6 +79,14 @@ func TestContextLimitFor(t *testing.T) {
 		{"claude-opus-4-1", 1_000_000},
 		{"claude-sonnet-5", 1_000_000},
 		{"claude-opus-5", 1_000_000},
+		// Bare family names (no version) denote "latest of family" → 1M. These
+		// reach ContextLimitFor only when the model cache is unavailable; normally
+		// Resolver.Resolve expands them to a concrete versioned id first.
+		{"opus", 1_000_000},
+		{"sonnet", 1_000_000},
+		{"claude-opus", 1_000_000},
+		{"opus[1m]", 1_000_000},
+		{"sonnet[1m]", 1_000_000},
 		// Haiku 4.5 → 200k.
 		{"claude-haiku-4-5", 200_000},
 		{"claude-haiku-4-5-20251001", 200_000},
