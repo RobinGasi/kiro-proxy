@@ -13,24 +13,28 @@
  */
 
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { API_KEY_ENV, buildModel, fetchModelIds, resolveProxy } from "./proxy.ts";
-
-const PROVIDER = "kiro";
+import { registerCredits } from "./credits.ts";
+import { API_KEY_ENV, buildModel, fetchModelIds, PROVIDER, resolveProxy } from "./proxy.ts";
 
 export default function kiroProviderExtension(pi: ExtensionAPI) {
-	const { baseUrl, apiKey } = resolveProxy(pi.pi.getAgentDir());
+	const target = resolveProxy(pi.pi.getAgentDir());
 
 	pi.setLabel("Kiro models");
 
 	pi.registerProvider(PROVIDER, {
-		baseUrl,
+		baseUrl: target.baseUrl,
 		// An env var *name*, not the secret: omp resolves `apiKey` through the
 		// shared config resolver, and `resolveProxy` publishes the key there.
-		...(apiKey ? { apiKey: API_KEY_ENV } : {}),
+		...(target.apiKey ? { apiKey: API_KEY_ENV } : {}),
 		api: "openai-completions",
 		authHeader: true,
 		// Runs through omp's SQLite model cache (24 h TTL), so the catalog tracks
 		// whatever the proxy currently serves instead of a hardcoded list.
-		fetchDynamicModels: async (resolvedKey) => (await fetchModelIds(baseUrl, resolvedKey ?? apiKey)).map(buildModel),
+		fetchDynamicModels: async (resolvedKey) =>
+			(await fetchModelIds(target.baseUrl, resolvedKey ?? target.apiKey)).map(buildModel),
 	});
+
+	// Kiro bills credits, not tokens, so omp's cost/token segments read 0 —
+	// `credits <used>/<total>` in the status line replaces them.
+	registerCredits(pi, target);
 }

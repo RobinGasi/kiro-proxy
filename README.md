@@ -58,10 +58,29 @@ Per-family metadata the bare id list cannot supply:
   folds onto `xhigh`.
 - **Context windows** mirror the proxy's `ContextLimitFor` — 1M for Opus/Sonnet 4.x+, 200k for Haiku 4.5 and the
   `auto-kiro` router (whose backing model cannot be known ahead of time, so it stays conservative).
-- **Cost is reported as 0**: Kiro bills credits, not tokens.
+- **Cost is reported as 0**: Kiro bills credits, not tokens — see [Credits](#credits).
 
 omp merges its own reference metadata for ids it already knows (`gpt-5.6-*`, `minimax-*`), so those rows show their
 native effort ladders rather than the Claude one.
+
+## Credits
+
+Because the billing unit is credits, omp's cost and token segments read `0` on every kiro turn. The status line
+carries the credit pool instead, refreshed at session start and after every turn while a `kiro` model is active:
+
+```text
+credits 194/10,000
+```
+
+`/kiro-credits` forces a fresh read and prints the full breakdown:
+
+```text
+Kiro credits: 194 / 10,000 used · 9,806 left (98.1% free)
+```
+
+Both read the proxy's `GET /v1/usage`. Upstream reads are throttled to one per 15 s and coalesced, so a burst of
+short turns cannot hammer Kiro's usage API through the proxy. A failed read keeps the last good value in the status
+line — glanceable, never flickering — and `/kiro-credits` is where the reason is reported.
 
 ## Configuration
 
@@ -82,6 +101,7 @@ happens to start with `!` can never be mistaken for a command.
 
 - `src/provider.ts` — extension factory: `registerProvider` for the `kiro` provider
 - `src/proxy.ts` — endpoint/key resolution, live model list, per-family model metadata
+- `src/credits.ts` — credit balance cache, status-line readout, `/kiro-credits`
 
 The package imports `@oh-my-pi/pi-coding-agent` **type-only**; the single host value it needs (`getAgentDir`) comes
 through `pi.pi`, so a linked plugin never has to resolve the host package at runtime.

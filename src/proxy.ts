@@ -13,6 +13,9 @@ import type { ProviderModelConfig } from "@oh-my-pi/pi-coding-agent";
 /** Env var the provider registration points at; see {@link resolveProxy}. */
 export const API_KEY_ENV = "KIRO_PROXY_API_KEY";
 
+/** Provider name registered with omp; also the `provider` field on kiro models. */
+export const PROVIDER = "kiro";
+
 /**
  * Fallback catalog, used only when the proxy is unreachable *and* omp has no
  * cached model list yet. Keeping it small and current beats an empty provider.
@@ -167,4 +170,37 @@ export async function fetchModelIds(baseUrl: string, apiKey: string | undefined)
 	} catch {
 		return SEED_MODEL_IDS;
 	}
+}
+
+/** Credit balance the proxy reports for the account it is currently serving. */
+export interface KiroCredits {
+	total: number;
+	used: number;
+	remaining: number;
+}
+
+/**
+ * Live credit balance from the proxy's `GET /v1/usage`.
+ *
+ * Unlike {@link fetchModelIds} this throws instead of degrading: the status line
+ * swallows the failure, but `/kiro-credits` reports the reason.
+ */
+export async function fetchCredits(baseUrl: string, apiKey: string | undefined): Promise<KiroCredits> {
+	const response = await fetch(`${baseUrl}/usage`, {
+		headers: apiKey ? { authorization: `Bearer ${apiKey}` } : undefined,
+		signal: AbortSignal.timeout(5_000),
+	});
+	const payload = (await response.json().catch(() => undefined)) as
+		| { total_credits?: number; used_credits?: number; remaining_credits?: number; error?: { message?: string } }
+		| undefined;
+	if (!response.ok) {
+		// The proxy emits an OpenAI-shaped envelope: {"error":{"message":"…"}}
+		// (internal/api/openai/routes.go:writeError).
+		throw new Error(payload?.error?.message ?? `GET /v1/usage -> ${response.status}`);
+	}
+	const { total_credits: total, used_credits: used, remaining_credits: remaining } = payload ?? {};
+	if (typeof total !== "number" || typeof used !== "number" || typeof remaining !== "number") {
+		throw new Error("GET /v1/usage returned an unrecognized payload");
+	}
+	return { total, used, remaining };
 }
