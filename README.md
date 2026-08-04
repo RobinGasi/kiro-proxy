@@ -13,7 +13,18 @@ is handed off to a second agent, so the full omp toolchain stays in play on ever
 ## Install
 
 ```sh
-omp plugin link ~/projects/private/omp-kiro
+omp plugin install git+https://git.gasi.dev/robin/omp-kiro.git
+```
+
+The `git+` prefix matters: without it `bun install` treats the URL as a tarball and fails. The repo is
+public, so no credentials are needed.
+
+Developing on it instead? Clone and link, so edits in the working tree are live:
+
+```sh
+git clone https://git.gasi.dev/robin/omp-kiro.git
+omp plugin uninstall omp-kiro   # only if a copy is already installed — link cannot replace it
+omp plugin link ./omp-kiro
 ```
 
 Restart omp — extension modules are wired at session start, so `/reload-plugins` is not enough.
