@@ -154,7 +154,7 @@ func convertToolResultsToKiroFormat(results []ToolResult) []any {
 		out = append(out, map[string]any{
 			"content":   []any{map[string]any{"text": text}},
 			"status":    "success",
-			"toolUseId": tr.ToolUseID,
+			"toolUseId": SanitizeToolUseID(tr.ToolUseID),
 		})
 	}
 	return out
@@ -175,7 +175,7 @@ func extractToolResultsFromContent(parts []ContentPart) []any {
 		out = append(out, map[string]any{
 			"content":   []any{map[string]any{"text": text}},
 			"status":    "success",
-			"toolUseId": p.ToolUseID,
+			"toolUseId": SanitizeToolUseID(p.ToolUseID),
 		})
 	}
 	return out
@@ -191,7 +191,7 @@ func extractToolUsesFromMessage(parts []ContentPart, toolCalls []ToolCall) []any
 		out = append(out, map[string]any{
 			"name":      tc.Function.Name,
 			"input":     argsToInput(tc.Function.Arguments),
-			"toolUseId": tc.ID,
+			"toolUseId": SanitizeToolUseID(tc.ID),
 		})
 	}
 
@@ -206,7 +206,7 @@ func extractToolUsesFromMessage(parts []ContentPart, toolCalls []ToolCall) []any
 		out = append(out, map[string]any{
 			"name":      p.Name,
 			"input":     input,
-			"toolUseId": p.ID,
+			"toolUseId": SanitizeToolUseID(p.ID),
 		})
 	}
 
