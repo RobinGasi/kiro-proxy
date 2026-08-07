@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"git.gasi.dev/robin/kiro-proxy/internal/config"
+	"git.gasi.dev/robin/kiro-proxy/internal/debuglog"
 )
 
 func main() {
@@ -33,7 +34,17 @@ func main() {
 	}
 
 	cfg := config.Load()
-	setupLogging(cfg.LogLevel)
+
+	// Per-request debug capture. Off by default; DEBUG_MODE=errors|all turns it
+	// on and every artifact lands under cfg.DebugDir. It is built before logging
+	// is set up because it owns the debug log sink.
+	dbg := debuglog.New(cfg)
+	defer func() { _ = dbg.Close() }()
+
+	setupLogging(cfg.LogLevel, dbg)
+	if dbg.Mode() != debuglog.ModeOff {
+		slog.Info("debug capture enabled", "mode", dbg.Mode(), "dir", dbg.Dir())
+	}
 
 	bindHost, bindPort := resolveServerConfig(cfg, *host, *port)
 
@@ -54,7 +65,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              bindHost + ":" + strconv.Itoa(bindPort),
-		Handler:           requestLogger(mux, slog.Default()),
+		Handler:           requestLogger(mux, slog.Default(), dbg),
 		ReadHeaderTimeout: 30 * time.Second,
 		// No write/idle timeout: SSE streams are long-lived. Per-request
 		// deadlines are applied via context in the handlers/upstream client.
@@ -83,7 +94,7 @@ func main() {
 	}
 }
 
-func setupLogging(level string) {
+func setupLogging(level string, dbg *debuglog.Logger) {
 	var lvl slog.Level
 	switch level {
 	case "TRACE", "DEBUG":
@@ -95,8 +106,10 @@ func setupLogging(level string) {
 	default:
 		lvl = slog.LevelInfo
 	}
+	// dbg.NewHandler mirrors every record into the debug log files when
+	// DEBUG_MODE is on, and is a pass-through otherwise.
 	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})
-	slog.SetDefault(slog.New(h))
+	slog.SetDefault(slog.New(dbg.NewHandler(h)))
 }
 
 // resolveServerConfig applies the CLI > ENV > default priority.

@@ -34,6 +34,7 @@ import (
 	"strings"
 	"time"
 
+	"git.gasi.dev/robin/kiro-proxy/internal/debuglog"
 	"git.gasi.dev/robin/kiro-proxy/internal/tokenizer"
 	"git.gasi.dev/robin/kiro-proxy/internal/util"
 )
@@ -100,23 +101,19 @@ type AuthManager interface {
 	ProfileARN() string
 }
 
-// RawChunkLogger optionally records the raw MCP request/response payloads for
-// debugging. *debuglog.Request satisfies it; a nil logger disables capture.
-type RawChunkLogger interface {
-	LogRawChunk(chunk []byte)
-}
-
-// Client performs Kiro MCP API calls. It bundles the shared HTTP client, a
-// logger, and an optional debug recorder. The zero value is usable (it falls
-// back to http.DefaultClient and slog.Default()), but prefer NewClient.
+// Client performs Kiro MCP API calls. It bundles the shared HTTP client and a
+// logger. The zero value is usable (it falls back to http.DefaultClient and
+// slog.Default()), but prefer NewClient.
+//
+// One Client is shared by every request, so the raw MCP request/response capture
+// is resolved per call from the context (see debuglog.FromContext) rather than
+// held in a field.
 type Client struct {
 	// HTTP is the shared upstream HTTP client (see internal/transport). When nil,
 	// http.DefaultClient is used.
 	HTTP *http.Client
 	// Logger receives diagnostic logs. When nil, slog.Default() is used.
 	Logger *slog.Logger
-	// Debug, when non-nil, captures the raw MCP request and response.
-	Debug RawChunkLogger
 }
 
 // NewClient returns a Client using the given HTTP client and logger (either may
@@ -321,10 +318,10 @@ func (c *Client) CallKiroMCPAPI(ctx context.Context, am AuthManager, query strin
 	if err != nil {
 		return "", nil, fmt.Errorf("mcp api: encode request: %w", err)
 	}
-	if c.Debug != nil {
-		if pretty, e := json.MarshalIndent(mcpRequest, "", "  "); e == nil {
-			c.Debug.LogRawChunk(append([]byte("[MCP REQUEST]\n"), pretty...))
-		}
+	// Capture the raw MCP exchange; a no-op unless DEBUG_MODE is on.
+	dbg := debuglog.FromContext(ctx)
+	if pretty, e := json.MarshalIndent(mcpRequest, "", "  "); e == nil {
+		dbg.LogRawChunk(append([]byte("[MCP REQUEST]\n"), pretty...))
 	}
 
 	token, err := am.GetAccessToken(ctx)
@@ -358,11 +355,9 @@ func (c *Client) CallKiroMCPAPI(ctx context.Context, am AuthManager, query strin
 		c.logger().Error("MCP API error", "status", resp.StatusCode)
 		return "", nil, fmt.Errorf("mcp api: unexpected status %d", resp.StatusCode)
 	}
-	if c.Debug != nil {
-		var pretty bytes.Buffer
-		if json.Indent(&pretty, body, "", "  ") == nil {
-			c.Debug.LogRawChunk(append([]byte("[MCP RESPONSE]\n"), pretty.Bytes()...))
-		}
+	var pretty bytes.Buffer
+	if json.Indent(&pretty, body, "", "  ") == nil {
+		dbg.LogRawChunk(append([]byte("[MCP RESPONSE]\n"), pretty.Bytes()...))
 	}
 
 	var mr struct {

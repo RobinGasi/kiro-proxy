@@ -27,6 +27,7 @@ import (
 
 	"git.gasi.dev/robin/kiro-proxy/internal/awsstream"
 	"git.gasi.dev/robin/kiro-proxy/internal/config"
+	"git.gasi.dev/robin/kiro-proxy/internal/debuglog"
 	"git.gasi.dev/robin/kiro-proxy/internal/thinking"
 	"git.gasi.dev/robin/kiro-proxy/internal/tokenizer"
 )
@@ -222,7 +223,11 @@ func StreamWithFirstTokenRetryOpts(ctx context.Context, cfg *config.Config, star
 			if resp.StatusCode != http.StatusOK {
 				body, _ := io.ReadAll(resp.Body)
 				_ = resp.Body.Close()
-				slog.Error("streaming: upstream error", "status", resp.StatusCode)
+				// Record the upstream error body verbatim: for a Kiro 400 this is
+				// the only place the real reason appears.
+				debuglog.FromContext(ctx).LogRawChunk(body)
+				slog.ErrorContext(ctx, "streaming: upstream error",
+					"status", resp.StatusCode, "body", string(body))
 				errc <- &UpstreamStatusError{StatusCode: resp.StatusCode, Body: string(body)}
 				return
 			}
@@ -260,6 +265,7 @@ func StreamWithFirstTokenRetryOpts(ctx context.Context, cfg *config.Config, star
 // body is always closed before returning.
 func parseKiroStream(ctx context.Context, cfg *config.Config, resp *http.Response, opts StreamOptions, out chan<- KiroEvent) (retErr error) {
 	defer func() { _ = resp.Body.Close() }()
+	dbg := debuglog.FromContext(ctx)
 
 	firstTokenTimeout := seconds(cfg.FirstTokenTimeout, DefaultFirstTokenTimeout)
 	readTimeout := seconds(cfg.StreamingReadTimeout, DefaultStreamingReadTimeout)
@@ -344,6 +350,7 @@ func parseKiroStream(ctx context.Context, cfg *config.Config, resp *http.Respons
 				return rc.err
 			}
 			firstReceived = true
+			dbg.LogRawChunk(rc.data)
 			if err := processChunk(ctx, parser, tp, rc.data, out); err != nil {
 				return err
 			}

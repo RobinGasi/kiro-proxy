@@ -12,6 +12,7 @@ import (
 	"git.gasi.dev/robin/kiro-proxy/internal/apiauth"
 	"git.gasi.dev/robin/kiro-proxy/internal/config"
 	"git.gasi.dev/robin/kiro-proxy/internal/converter"
+	"git.gasi.dev/robin/kiro-proxy/internal/debuglog"
 	"git.gasi.dev/robin/kiro-proxy/internal/mcp"
 	"git.gasi.dev/robin/kiro-proxy/internal/model"
 	"git.gasi.dev/robin/kiro-proxy/internal/payloadguard"
@@ -185,6 +186,10 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		h.writeError(w, http.StatusBadRequest, "Failed to build request: "+err.Error())
 		return
 	}
+
+	// The transformed upstream payload is the artifact that explains a Kiro 400,
+	// so it is captured before the request is sent (no-op unless DEBUG_MODE is on).
+	debuglog.FromContext(ctx).LogKiroRequestBody(payload)
 
 	start := func(ctx context.Context) (*http.Response, error) {
 		return h.upstream.SendConversation(ctx, am, payload, req.Stream)
