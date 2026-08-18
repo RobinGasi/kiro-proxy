@@ -19,8 +19,11 @@ export const PROVIDER = "kiro";
 /**
  * Fallback catalog, used only when the proxy is unreachable *and* omp has no
  * cached model list yet. Keeping it small and current beats an empty provider.
+ *
+ * Ids only: token limits are left absent so {@link buildModel} resolves them
+ * through {@link fallbackLimits} rather than duplicating them here.
  */
-const SEED_MODEL_IDS = [
+const SEED_MODELS: KiroModel[] = [
 	"auto-kiro",
 	"claude-opus-5",
 	"claude-sonnet-5",
@@ -28,7 +31,7 @@ const SEED_MODEL_IDS = [
 	"claude-sonnet-4.6",
 	"claude-haiku-4.5",
 	"gpt-5.6-sol",
-];
+].map((id) => ({ id }));
 
 /** Read a value from the process env, falling back to `<agentDir>/.env` (`~/.omp/agent/.env`). */
 function readAgentEnvValue(name: string, agentDir: string): string | undefined {
@@ -107,18 +110,61 @@ export function resolveProxy(agentDir: string): ProxyTarget {
 }
 
 /**
- * Input-context window Kiro actually serves, mirroring the proxy's own
- * `internal/model/resolver.go:ContextLimitFor`: a 1M window for Opus and Sonnet
- * 4.x+, 200k for Haiku 4.5. Unknown Claude ids — and the `auto-kiro` router,
- * whose backing model cannot be known ahead of time — fall back to 200k so omp
- * compacts early rather than overflowing.
+ * Token limits Kiro serves, used only when the proxy is unreachable *and* omp has
+ * no cached catalog yet. The proxy reports these live from Kiro's own
+ * `ListAvailableModels` (`context_window` / `max_output_tokens` on `/v1/models`),
+ * so this table is a cold-start floor rather than a source of truth.
+ *
+ * Verified against Kiro's catalog on 2026-08-18. The GPT-5.6 tiers match Kiro's
+ * published 272K context window (https://kiro.dev/changelog/models/gpt-5-6/).
  */
-function claudeContextWindow(id: string): number {
-	const match = id.match(/claude-(opus|sonnet|haiku)-(\d+)/);
-	if (!match) return 200_000;
-	const family = match[1];
-	const major = Number(match[2]);
-	return (family === "opus" || family === "sonnet") && major >= 4 ? 1_000_000 : 200_000;
+const OFFLINE_LIMITS: Record<string, { contextWindow: number; maxTokens: number }> = {
+	// The router dispatches to whichever model Kiro picks, so its own advertised
+	// 1M window is an upper bound rather than something a turn can rely on. Both
+	// numbers are therefore the floor across the catalog below: the smallest
+	// window any backing model serves, and the smallest output ceiling. The proxy
+	// deliberately reports no limits for this id, so this entry always applies.
+	"auto-kiro": { contextWindow: 196_000, maxTokens: 64_000 },
+	"claude-haiku-4.5": { contextWindow: 200_000, maxTokens: 64_000 },
+	"claude-opus-4.5": { contextWindow: 200_000, maxTokens: 64_000 },
+	"claude-opus-4.6": { contextWindow: 1_000_000, maxTokens: 64_000 },
+	"claude-opus-4.7": { contextWindow: 1_000_000, maxTokens: 128_000 },
+	"claude-opus-4.8": { contextWindow: 1_000_000, maxTokens: 128_000 },
+	"claude-opus-5": { contextWindow: 1_000_000, maxTokens: 128_000 },
+	"claude-sonnet-4": { contextWindow: 200_000, maxTokens: 64_000 },
+	"claude-sonnet-4.5": { contextWindow: 200_000, maxTokens: 64_000 },
+	"claude-sonnet-4.6": { contextWindow: 1_000_000, maxTokens: 64_000 },
+	"claude-sonnet-5": { contextWindow: 1_000_000, maxTokens: 64_000 },
+	"gpt-5.6-luna": { contextWindow: 272_000, maxTokens: 128_000 },
+	"gpt-5.6-sol": { contextWindow: 272_000, maxTokens: 128_000 },
+	"gpt-5.6-terra": { contextWindow: 272_000, maxTokens: 128_000 },
+	"minimax-m2.1": { contextWindow: 196_000, maxTokens: 64_000 },
+	"minimax-m2.5": { contextWindow: 196_000, maxTokens: 64_000 },
+	"qwen3-coder-next": { contextWindow: 256_000, maxTokens: 64_000 },
+};
+
+/**
+ * Cold-start limits for an id {@link OFFLINE_LIMITS} does not cover — typically a
+ * model released after this table was last verified. Unknown non-Claude ids stay
+ * deliberately conservative: omp compacts early instead of overflowing upstream.
+ *
+ * The Claude branch mirrors the proxy's own family rule
+ * (`internal/model/resolver.go:familyContextLimit`): a 1M window for Opus and
+ * Sonnet 4.x+, 200k otherwise.
+ */
+function fallbackLimits(id: string): { contextWindow: number; maxTokens: number } {
+	const known = OFFLINE_LIMITS[id];
+	if (known) return known;
+
+	const claude = id.match(/claude-(opus|sonnet|haiku)-(\d+)/);
+	if (!claude) return { contextWindow: 200_000, maxTokens: 8_192 };
+
+	const [, family, major] = claude;
+	const wide = (family === "opus" || family === "sonnet") && Number(major) >= 4;
+	return {
+		contextWindow: wide ? 1_000_000 : 200_000,
+		maxTokens: family === "haiku" ? 16_384 : 32_000,
+	};
 }
 
 /**
@@ -137,11 +183,42 @@ const THINKING = {
 	effortMap: { max: "xhigh" },
 } as unknown as NonNullable<ProviderModelConfig["thinking"]>;
 
-/** The proxy's `/v1/models` returns bare ids, so per-family metadata lives here. */
-export function buildModel(id: string): ProviderModelConfig {
+/**
+ * One entry of the proxy's `/v1/models` listing.
+ *
+ * `contextWindow` and `maxOutputTokens` are the proxy's private extension to the
+ * OpenAI shape, carrying the token limits Kiro reports for the model. They are
+ * absent when the proxy could not establish a limit, which is why they are
+ * optional here rather than defaulted — an absent field means "ask the fallback",
+ * not "zero".
+ */
+export interface KiroModel {
+	id: string;
+	contextWindow?: number;
+	maxOutputTokens?: number;
+}
+
+/**
+ * Accept a proxy-supplied limit only when it is a usable token count. A
+ * malformed, zero, negative or non-integer value is discarded so the offline
+ * fallback answers instead of omp inheriting a broken window.
+ */
+function tokenLimit(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+/**
+ * Turn a discovered entry into an omp model definition. Token limits come from
+ * the proxy when it supplied them (Kiro's own `tokenLimits`), otherwise from
+ * {@link fallbackLimits}. Everything else — modality, effort ladder, credit-based
+ * cost — is a property of the model family, not of the catalog.
+ */
+export function buildModel(entry: KiroModel): ProviderModelConfig {
+	const { id } = entry;
 	const claude = id.includes("claude") || id === "auto-kiro";
 	const qwen = id.startsWith("qwen");
 	const reasoning = !qwen;
+	const fallback = fallbackLimits(id);
 
 	return {
 		id,
@@ -151,24 +228,34 @@ export function buildModel(id: string): ProviderModelConfig {
 		input: (claude ? ["text", "image"] : ["text"]) as ("text" | "image")[],
 		// Billed in Kiro credits, not per token.
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: claude ? claudeContextWindow(id) : id.startsWith("minimax") ? 200_000 : 128_000,
-		maxTokens: claude ? (id.includes("haiku") ? 16_384 : 32_000) : 8_192,
+		contextWindow: tokenLimit(entry.contextWindow) ?? fallback.contextWindow,
+		maxTokens: tokenLimit(entry.maxOutputTokens) ?? fallback.maxTokens,
 	};
 }
 
-/** Live model list from the proxy; falls back to the seed when it is unreachable. */
-export async function fetchModelIds(baseUrl: string, apiKey: string | undefined): Promise<string[]> {
+/** Live catalog from the proxy; falls back to the seed when it is unreachable. */
+export async function fetchModels(baseUrl: string, apiKey: string | undefined): Promise<KiroModel[]> {
 	try {
 		const response = await fetch(`${baseUrl}/models`, {
 			headers: apiKey ? { authorization: `Bearer ${apiKey}` } : undefined,
 			signal: AbortSignal.timeout(5_000),
 		});
 		if (!response.ok) throw new Error(`GET /v1/models -> ${response.status}`);
-		const payload = (await response.json()) as { data?: { id?: string }[] };
-		const ids = (payload.data ?? []).map((model) => model.id).filter((id): id is string => Boolean(id));
-		return ids.length ? ids : SEED_MODEL_IDS;
+		const payload = (await response.json()) as {
+			data?: { id?: string; context_window?: unknown; max_output_tokens?: unknown }[];
+		};
+		const models = (payload.data ?? [])
+			.filter((entry): entry is { id: string; context_window?: unknown; max_output_tokens?: unknown } =>
+				Boolean(entry?.id),
+			)
+			.map((entry) => ({
+				id: entry.id,
+				contextWindow: tokenLimit(entry.context_window),
+				maxOutputTokens: tokenLimit(entry.max_output_tokens),
+			}));
+		return models.length ? models : SEED_MODELS;
 	} catch {
-		return SEED_MODEL_IDS;
+		return SEED_MODELS;
 	}
 }
 

@@ -51,17 +51,27 @@ from the proxy's `/v1/models` through `fetchDynamicModels`, which rides omp's ow
 the catalog tracks whatever the proxy currently serves instead of a hardcoded list. A small seed list covers the case
 where the proxy is down *and* the cache is cold.
 
-Per-family metadata the bare id list cannot supply:
+**Token limits come from Kiro.** The proxy reads each model's `tokenLimits` from Kiro's own `ListAvailableModels` and
+relays them on `/v1/models` as `context_window` and `max_output_tokens` — a private extension to the OpenAI shape,
+omitted when no limit could be established. So GPT-5.6 Sol advertises the
+[272K window Kiro documents](https://kiro.dev/changelog/models/gpt-5-6/) with a 128K output ceiling, and a model
+Kiro re-tiers is picked up on the next refresh without a plugin change.
+
+When a field is absent — cold cache with the proxy down, or a limit the proxy could not establish — `buildModel`
+falls back to a table of the limits verified against Kiro's catalog, then to a conservative default (200k context,
+8,192 output) for an id it has never seen. The `auto-kiro` router stays on that conservative default on purpose: its
+backing model, and therefore its window, cannot be known ahead of time.
+
+Metadata that is a property of the family rather than the catalog stays local:
 
 - **Thinking** maps to `reasoning_effort`, which the proxy converts to a thinking budget as a percentage of max output
   tokens (`internal/api/openai/convert.go:reasoningEffortBudget`). Ladder `minimal, low, medium, high, xhigh`; `max`
   folds onto `xhigh`.
-- **Context windows** mirror the proxy's `ContextLimitFor` — 1M for Opus/Sonnet 4.x+, 200k for Haiku 4.5 and the
-  `auto-kiro` router (whose backing model cannot be known ahead of time, so it stays conservative).
+- **Modality**: Claude ids accept images, the rest are text-only.
 - **Cost is reported as 0**: Kiro bills credits, not tokens — see [Credits](#credits).
 
-omp merges its own reference metadata for ids it already knows (`gpt-5.6-*`, `minimax-*`), so those rows show their
-native effort ladders rather than the Claude one.
+Discovery is authoritative: omp persists the definition this extension returns, so a metadata fix has to land here (or
+in the proxy) rather than being merged in from another provider's reference catalog.
 
 ## Credits
 
@@ -100,7 +110,7 @@ happens to start with `!` can never be mistaken for a command.
 ## Layout
 
 - `src/provider.ts` — extension factory: `registerProvider` for the `kiro` provider
-- `src/proxy.ts` — endpoint/key resolution, live model list, per-family model metadata
+- `src/proxy.ts` — endpoint/key resolution, live catalog discovery, model metadata and limit fallbacks
 - `src/credits.ts` — credit balance cache, status-line readout, `/kiro-credits`
 
 The package imports `@oh-my-pi/pi-coding-agent` **type-only**; the single host value it needs (`getAgentDir`) comes
