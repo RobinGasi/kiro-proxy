@@ -5,7 +5,8 @@
 	"type": "module",
 	"description": "Kiro models for omp via the local kiro-proxy, driven by omp's own agent loop",
 	"scripts": {
-		"check": "tsc --noEmit"
+		"check": "tsc --noEmit",
+		"test": "bun test"
 	},
 	"omp": {
 		"extensions": ["./src/provider.ts"]
@@ -15,6 +16,7 @@
 	},
 	"devDependencies": {
 		"@oh-my-pi/pi-coding-agent": "17.2.7",
+		"@types/bun": "1.3.14",
 		"@types/node": "^26.1.2"
 	}
 }

@@ -5,7 +5,7 @@
 		"module": "preserve",
 		"moduleResolution": "bundler",
 		"allowImportingTsExtensions": true,
-		"types": ["node"],
+		"types": ["node", "bun"],
 		"strict": true,
 		"noEmit": true,
 		"skipLibCheck": true,
