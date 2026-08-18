@@ -39,12 +39,12 @@ import (
 	"git.gasi.dev/robin/kiro-proxy/internal/modelcache"
 )
 
-// ModelFetcher fetches the list of available model IDs for an account from
-// upstream (typically a thin wrapper over upstream.ListAvailableModels). It is
-// injected rather than imported so the account package stays free of an api/*
-// dependency. The account being refreshed is passed so the fetcher can read its
-// auth manager via Account.Auth.
-type ModelFetcher func(ctx context.Context, a *Account) ([]string, error)
+// ModelFetcher fetches an account's model catalog from upstream — model IDs plus
+// the token limits Kiro reports for them (typically a thin wrapper over
+// upstream.ListAvailableModels). It is injected rather than imported so the
+// account package stays free of an api/* dependency. The account being refreshed
+// is passed so the fetcher can read its auth manager via Account.Auth.
+type ModelFetcher func(ctx context.Context, a *Account) ([]model.CatalogModel, error)
 
 // AccountStats tracks per-account request counters for monitoring.
 type AccountStats struct {
@@ -473,8 +473,8 @@ func (m *Manager) maybeRefreshModels(ctx context.Context, a *Account) {
 }
 
 // fetchClosure adapts the manager's ModelFetcher to the cache's fetch signature.
-func (m *Manager) fetchClosure(a *Account) func(context.Context) ([]string, error) {
-	return func(ctx context.Context) ([]string, error) {
+func (m *Manager) fetchClosure(a *Account) func(context.Context) ([]model.CatalogModel, error) {
+	return func(ctx context.Context) ([]model.CatalogModel, error) {
 		return m.fetch(ctx, a)
 	}
 }
@@ -573,24 +573,34 @@ func (m *Manager) Accounts() []*Account {
 }
 
 // AllAvailableModels returns the sorted union of available models across all
-// initialized accounts. Used by model-listing endpoints.
-func (m *Manager) AllAvailableModels() []string {
+// initialized accounts, each with the token limits its owning account can
+// establish (live catalog first, then the offline table). Used by model-listing
+// endpoints.
+//
+// When two accounts disagree about a model's limits — different regions can serve
+// different catalogs — the larger window wins, since the account that serves the
+// request is picked independently of this listing.
+func (m *Manager) AllAvailableModels() []model.CatalogModel {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	set := map[string]struct{}{}
+	caps := map[string]model.Capabilities{}
 	for _, a := range m.accounts {
 		if a.resolver == nil {
 			continue
 		}
 		for _, id := range a.resolver.GetAvailableModels() {
-			set[id] = struct{}{}
+			found, _ := a.resolver.Capabilities(id)
+			if best, seen := caps[id]; seen && best.MaxInputTokens >= found.MaxInputTokens {
+				continue
+			}
+			caps[id] = found
 		}
 	}
-	out := make([]string, 0, len(set))
-	for id := range set {
-		out = append(out, id)
+	out := make([]model.CatalogModel, 0, len(caps))
+	for id, c := range caps {
+		out = append(out, model.CatalogModel{ID: id, Capabilities: c})
 	}
-	sort.Strings(out)
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
 

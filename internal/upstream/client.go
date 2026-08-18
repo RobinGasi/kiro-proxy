@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"git.gasi.dev/robin/kiro-proxy/internal/config"
+	"git.gasi.dev/robin/kiro-proxy/internal/model"
 	"git.gasi.dev/robin/kiro-proxy/internal/util"
 )
 
@@ -105,13 +106,18 @@ func (c *Client) SendConversation(ctx context.Context, am AuthProvider, payload 
 
 // ListAvailableModels calls Kiro's ListAvailableModels operation at am.QHost()
 // (GET with origin=AI_EDITOR, plus profileArn when the account has one) and
-// returns the model IDs. It uses the same retry/backoff/403-refresh policy as
+// returns the catalog: each model's id plus the token limits Kiro reports for it
+// (`tokenLimits`). It uses the same retry/backoff/403-refresh policy as
 // SendConversation.
+//
+// Limits are optional per entry — an entry that omits or malforms them yields a
+// zero model.Capabilities, which downstream reads as "not reported" and falls
+// back rather than trusting a zero limit.
 //
 // On any failure it returns a non-nil error (so callers can fall back to a
 // static list); when the upstream responds with a non-200 the error includes the
 // upstream detail (message and reason) rather than masking it.
-func (c *Client) ListAvailableModels(ctx context.Context, am AuthProvider) ([]string, error) {
+func (c *Client) ListAvailableModels(ctx context.Context, am AuthProvider) ([]model.CatalogModel, error) {
 	url := am.QHost() + listAvailableModelsPath
 	resp, err := c.doWithRetry(ctx, am, false, func(token string) (*http.Request, error) {
 		req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -142,22 +148,51 @@ func (c *Client) ListAvailableModels(ctx context.Context, am AuthProvider) ([]st
 	}
 	var parsed struct {
 		Models []struct {
-			ModelID string `json:"modelId"`
+			ModelID     string `json:"modelId"`
+			TokenLimits struct {
+				// Kiro sends plain integers, but they are decoded as JSON numbers
+				// so an exponent form (1.0e6) or a float cannot fail the whole
+				// catalog.
+				MaxInputTokens  json.Number `json:"maxInputTokens"`
+				MaxOutputTokens json.Number `json:"maxOutputTokens"`
+			} `json:"tokenLimits"`
 		} `json:"models"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return nil, fmt.Errorf("list available models: decode response: %w", err)
 	}
-	ids := make([]string, 0, len(parsed.Models))
+	models := make([]model.CatalogModel, 0, len(parsed.Models))
 	for _, m := range parsed.Models {
-		if m.ModelID != "" {
-			ids = append(ids, m.ModelID)
+		if m.ModelID == "" {
+			continue
 		}
+		models = append(models, model.CatalogModel{
+			ID: m.ModelID,
+			Capabilities: model.Capabilities{
+				MaxInputTokens:  tokenCount(m.TokenLimits.MaxInputTokens),
+				MaxOutputTokens: tokenCount(m.TokenLimits.MaxOutputTokens),
+			},
+		})
 	}
-	if len(ids) == 0 {
+	if len(models) == 0 {
 		return nil, errors.New("list available models: response contained no models")
 	}
-	return ids, nil
+	return models, nil
+}
+
+// tokenCount converts a catalog token limit to a positive int, returning 0 for a
+// missing, unparseable, non-positive or absurdly large value. 0 means "not
+// reported", so a bad field degrades to the caller's fallback instead of
+// poisoning a limit.
+func tokenCount(n json.Number) int {
+	if n == "" {
+		return 0
+	}
+	f, err := n.Float64()
+	if err != nil || f <= 0 || f > math.MaxInt32 {
+		return 0
+	}
+	return int(f)
 }
 
 // doWithRetry runs build (which produces a fresh request for the current token)

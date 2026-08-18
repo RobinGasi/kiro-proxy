@@ -1,12 +1,14 @@
-// Package modelcache provides an in-memory, thread-safe cache of the model IDs
-// that Kiro currently exposes via ListAvailableModels. It implements the
+// Package modelcache provides an in-memory, thread-safe cache of the models that
+// Kiro currently exposes via ListAvailableModels, together with the per-model
+// token limits that response carries. It implements the
 // git.gasi.dev/robin/kiro-proxy/internal/model.Cache interface so the model
-// resolver can verify whether a (normalized) model name is known.
+// resolver can verify whether a (normalized) model name is known and answer
+// capability questions from live data.
 //
 // The cache holds a TTL and a last-refresh timestamp. It never performs any HTTP
 // itself: callers inject a fetch function into Refresh. On a failed (or empty)
 // refresh the previous contents are retained, so the cache always degrades to
-// the last good list — or the seeded fallback list — rather than going blank.
+// the last good catalog — or the seeded fallback list — rather than going blank.
 package modelcache
 
 import (
@@ -22,16 +24,17 @@ import (
 // Compile-time guarantee that *ModelInfoCache satisfies the resolver's Cache.
 var _ model.Cache = (*ModelInfoCache)(nil)
 
-// ModelInfoCache is a thread-safe cache of available model IDs.
+// ModelInfoCache is a thread-safe cache of the available models.
 //
 // It is seeded with a fallback list at construction time and kept fresh by
 // periodic calls to Refresh. The zero value is not usable; construct one with
 // New.
 type ModelInfoCache struct {
 	mu         sync.RWMutex
-	models     []string            // ordered, de-duplicated list of model IDs
-	valid      map[string]struct{} // set view of models for O(1) lookup
-	lastUpdate time.Time           // zero until the first successful Refresh
+	models     []string                      // ordered, de-duplicated list of model IDs
+	valid      map[string]struct{}           // set view of models for O(1) lookup
+	caps       map[string]model.Capabilities // token limits, only for models that reported them
+	lastUpdate time.Time                     // zero until the first successful Refresh
 	ttl        time.Duration
 	logger     *slog.Logger
 }
@@ -41,6 +44,10 @@ type ModelInfoCache struct {
 // time.Duration(cfg.ModelCacheTTL) * time.Second). Duplicate and empty IDs in
 // fallback are dropped, preserving first-seen order.
 //
+// The seed carries IDs only: capability lookups miss until the first successful
+// Refresh, which makes the resolver fall back to its own offline table rather
+// than inventing limits.
+//
 // The last-refresh timestamp is left unset, so NeedsRefresh reports true until
 // the first successful Refresh — the fallback contents are usable in the
 // meantime. A nil logger falls back to slog.Default().
@@ -48,14 +55,15 @@ func New(fallback []string, ttl time.Duration, logger *slog.Logger) *ModelInfoCa
 	if logger == nil {
 		logger = slog.Default()
 	}
-	deduped := dedupe(fallback)
-	valid := make(map[string]struct{}, len(deduped))
-	for _, id := range deduped {
-		valid[id] = struct{}{}
+	entries := make([]model.CatalogModel, 0, len(fallback))
+	for _, id := range fallback {
+		entries = append(entries, model.CatalogModel{ID: id})
 	}
+	models, valid, caps := index(entries)
 	return &ModelInfoCache{
-		models: deduped,
+		models: models,
 		valid:  valid,
+		caps:   caps,
 		ttl:    ttl,
 		logger: logger,
 	}
@@ -66,37 +74,33 @@ func New(fallback []string, ttl time.Duration, logger *slog.Logger) *ModelInfoCa
 // caller); the cache lock is not held while fetch runs.
 //
 // On a fetch error the previous (or fallback) contents are kept and the error is
-// returned. A successful fetch that yields no usable IDs is also treated as a
+// returned. A successful fetch that yields no usable models is also treated as a
 // no-op (previous contents kept) so the cache never goes empty. Only a
 // successful, non-empty refresh advances the last-refresh timestamp.
-func (c *ModelInfoCache) Refresh(ctx context.Context, fetch func(context.Context) ([]string, error)) error {
+func (c *ModelInfoCache) Refresh(ctx context.Context, fetch func(context.Context) ([]model.CatalogModel, error)) error {
 	if fetch == nil {
 		return errors.New("modelcache: fetch function is nil")
 	}
-	ids, err := fetch(ctx)
+	entries, err := fetch(ctx)
 	if err != nil {
 		// Return the error and let the caller log the outcome once — the existing
 		// (or fallback) contents are kept either way.
 		return err
 	}
-	deduped := dedupe(ids)
-	if len(deduped) == 0 {
+	models, valid, caps := index(entries)
+	if len(models) == 0 {
 		c.logger.Debug("model cache refresh returned no models; keeping existing contents")
 		return nil
 	}
 
-	valid := make(map[string]struct{}, len(deduped))
-	for _, id := range deduped {
-		valid[id] = struct{}{}
-	}
-
 	c.mu.Lock()
-	c.models = deduped
+	c.models = models
 	c.valid = valid
+	c.caps = caps
 	c.lastUpdate = time.Now()
 	c.mu.Unlock()
 
-	c.logger.Info("model cache refreshed", "count", len(deduped))
+	c.logger.Info("model cache refreshed", "count", len(models), "with_limits", len(caps))
 	return nil
 }
 
@@ -110,6 +114,19 @@ func (c *ModelInfoCache) IsValidModel(normalized string) bool {
 	defer c.mu.RUnlock()
 	_, ok := c.valid[normalized]
 	return ok
+}
+
+// Capabilities returns the token limits Kiro reported for normalized. It
+// implements model.Cache. ok is false when the model is unknown or the catalog
+// carried no limits for it, so the caller can fall back.
+func (c *ModelInfoCache) Capabilities(normalized string) (model.Capabilities, bool) {
+	if normalized == "" {
+		return model.Capabilities{}, false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	caps, ok := c.caps[normalized]
+	return caps, ok
 }
 
 // GetAllModelIDs returns a copy of all cached model IDs. It implements
@@ -146,20 +163,26 @@ func (c *ModelInfoCache) Size() int {
 	return len(c.models)
 }
 
-// dedupe returns ids with empty strings and duplicates removed, preserving the
-// order of first appearance.
-func dedupe(ids []string) []string {
-	seen := make(map[string]struct{}, len(ids))
-	out := make([]string, 0, len(ids))
-	for _, id := range ids {
-		if id == "" {
+// index builds the cache's three views from a catalog: the ordered ID list (with
+// empty IDs and duplicates dropped, first occurrence winning), its set view, and
+// the capability map — which only holds entries that actually reported a limit,
+// so a miss is distinguishable from a reported zero.
+func index(entries []model.CatalogModel) ([]string, map[string]struct{}, map[string]model.Capabilities) {
+	ids := make([]string, 0, len(entries))
+	valid := make(map[string]struct{}, len(entries))
+	caps := make(map[string]model.Capabilities, len(entries))
+	for _, e := range entries {
+		if e.ID == "" {
 			continue
 		}
-		if _, ok := seen[id]; ok {
+		if _, seen := valid[e.ID]; seen {
 			continue
 		}
-		seen[id] = struct{}{}
-		out = append(out, id)
+		valid[e.ID] = struct{}{}
+		ids = append(ids, e.ID)
+		if e.Capabilities.MaxInputTokens > 0 || e.Capabilities.MaxOutputTokens > 0 {
+			caps[e.ID] = e.Capabilities
+		}
 	}
-	return out
+	return ids, valid, caps
 }

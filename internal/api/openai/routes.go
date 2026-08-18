@@ -67,12 +67,26 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusUnauthorized, "Invalid or missing API key")
 		return
 	}
-	ids := h.accounts.AllAvailableModels()
-	models := make([]Model, 0, len(ids))
-	for _, id := range ids {
-		models = append(models, Model{ID: id, Object: "model", OwnedBy: "anthropic"})
+	writeJSON(w, http.StatusOK, ModelListFor(h.accounts.AllAvailableModels()))
+}
+
+// ModelListFor renders a catalog as the GET /v1/models response body. It is
+// separate from the handler so the response contract can be tested without
+// account selection or a live upstream.
+func ModelListFor(catalog []model.CatalogModel) ModelList {
+	models := make([]Model, 0, len(catalog))
+	for _, entry := range catalog {
+		models = append(models, Model{
+			ID:      entry.ID,
+			Object:  "model",
+			OwnedBy: "anthropic",
+			// Omitted when Kiro reported no limit, so a client can tell "unknown"
+			// from a real number (see Model).
+			ContextWindow:   entry.Capabilities.MaxInputTokens,
+			MaxOutputTokens: entry.Capabilities.MaxOutputTokens,
+		})
 	}
-	writeJSON(w, http.StatusOK, ModelList{Object: "list", Data: models})
+	return ModelList{Object: "list", Data: models}
 }
 
 // handleUsage returns the account's credit balance. It degrades to a JSON error
@@ -195,7 +209,7 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		return h.upstream.SendConversation(ctx, am, payload, req.Stream)
 	}
 
-	contextLimit := model.ContextLimitFor(res.Normalized, h.cfg.DefaultMaxInputTokens)
+	contextLimit := acct.Resolver().ContextLimitFor(req.Model, h.cfg.DefaultMaxInputTokens)
 	reasoningMode := h.cfg.FakeReasoningHandling
 
 	if req.Stream {

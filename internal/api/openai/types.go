@@ -208,11 +208,19 @@ type ChatCompletionChunkChoice struct {
 }
 
 // Model describes one AI model in the /v1/models listing.
+//
+// ContextWindow and MaxOutputTokens are a private extension to the OpenAI shape,
+// carrying the token limits Kiro reports for the model (`tokenLimits` in
+// ListAvailableModels). They are omitted when no limit could be established, so
+// an ID-only client is unaffected and a capability-aware one can tell "unknown"
+// from a real number instead of inheriting a wrong default.
 type Model struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created int64  `json:"created"`
-	OwnedBy string `json:"owned_by"`
+	ID              string `json:"id"`
+	Object          string `json:"object"`
+	Created         int64  `json:"created"`
+	OwnedBy         string `json:"owned_by"`
+	ContextWindow   int    `json:"context_window,omitempty"`
+	MaxOutputTokens int    `json:"max_output_tokens,omitempty"`
 }
 
 // ModelList is the response of GET /v1/models.

@@ -16,6 +16,10 @@ import (
 type Cache interface {
 	IsValidModel(normalized string) bool
 	GetAllModelIDs() []string
+	// Capabilities returns the token limits Kiro reported for normalized on the
+	// last successful refresh, or ok=false when the model is unknown or the
+	// catalog carried no limits for it.
+	Capabilities(normalized string) (Capabilities, bool)
 }
 
 var (
@@ -39,8 +43,65 @@ const (
 	contextWindow200K = 200_000
 )
 
+// Capabilities are the per-model token limits Kiro publishes in
+// ListAvailableModels (`tokenLimits`). A zero field means "not reported".
+type Capabilities struct {
+	MaxInputTokens  int
+	MaxOutputTokens int
+}
+
+// CatalogModel is one entry of Kiro's model catalog: the model id plus whatever
+// token limits the catalog reported for it.
+type CatalogModel struct {
+	ID           string
+	Capabilities Capabilities
+}
+
+// knownCapabilities is the offline fallback for model token limits, keyed by
+// normalized model id. It exists only so a cold start — or a Kiro region that
+// does not serve ListAvailableModels — still answers with real numbers instead
+// of a generic default; a live catalog always wins (Resolver.Capabilities).
+//
+// Verified against ListAvailableModels on 2026-08-18. The GPT-5.6 tiers match
+// Kiro's published 272K context window
+// (https://kiro.dev/changelog/models/gpt-5-6/).
+//
+// The "auto" router is deliberately absent: it dispatches to whichever model
+// Kiro picks, so the catalog's window for "auto" is an upper bound rather than
+// something a client can rely on. Callers keep their own conservative default.
+var knownCapabilities = map[string]Capabilities{
+	"claude-haiku-4.5":  {MaxInputTokens: 200_000, MaxOutputTokens: 64_000},
+	"claude-opus-4.5":   {MaxInputTokens: 200_000, MaxOutputTokens: 64_000},
+	"claude-opus-4.6":   {MaxInputTokens: 1_000_000, MaxOutputTokens: 64_000},
+	"claude-opus-4.7":   {MaxInputTokens: 1_000_000, MaxOutputTokens: 128_000},
+	"claude-opus-4.8":   {MaxInputTokens: 1_000_000, MaxOutputTokens: 128_000},
+	"claude-opus-5":     {MaxInputTokens: 1_000_000, MaxOutputTokens: 128_000},
+	"claude-sonnet-4":   {MaxInputTokens: 200_000, MaxOutputTokens: 64_000},
+	"claude-sonnet-4.5": {MaxInputTokens: 200_000, MaxOutputTokens: 64_000},
+	"claude-sonnet-4.6": {MaxInputTokens: 1_000_000, MaxOutputTokens: 64_000},
+	"claude-sonnet-5":   {MaxInputTokens: 1_000_000, MaxOutputTokens: 64_000},
+	"gpt-5.6-luna":      {MaxInputTokens: 272_000, MaxOutputTokens: 128_000},
+	"gpt-5.6-sol":       {MaxInputTokens: 272_000, MaxOutputTokens: 128_000},
+	"gpt-5.6-terra":     {MaxInputTokens: 272_000, MaxOutputTokens: 128_000},
+	"minimax-m2.1":      {MaxInputTokens: 196_000, MaxOutputTokens: 64_000},
+	"minimax-m2.5":      {MaxInputTokens: 196_000, MaxOutputTokens: 64_000},
+	"qwen3-coder-next":  {MaxInputTokens: 256_000, MaxOutputTokens: 64_000},
+}
+
+// CapabilitiesFor returns the offline-known token limits for modelID. The id is
+// normalized first, then matched exactly, so an unrelated GPT or Claude id keeps
+// the caller's own fallback rather than borrowing a neighbour's limits.
+func CapabilitiesFor(modelID string) (Capabilities, bool) {
+	caps, ok := knownCapabilities[NormalizeModelName(modelID)]
+	return caps, ok
+}
+
 // ContextLimitFor returns the known input-context window (in tokens) for the
 // given model, falling back to def when the model is unrecognized.
+//
+// Resolution order: the Claude family rules below, then the offline capability
+// table (CapabilitiesFor), then def. Prefer Resolver.ContextLimitFor, which
+// consults the live catalog before the offline table.
 //
 // Claude Opus and Sonnet 4.x (and newer), plus a bare "opus"/"sonnet" family
 // name (which denotes the latest of that family), expose a 1,000,000-token
@@ -51,9 +112,25 @@ const (
 // as "[1m]", date stamps and "-latest" do not affect the result.
 func ContextLimitFor(modelID string, def int) int {
 	normalized := NormalizeModelName(modelID)
+	if limit := familyContextLimit(normalized); limit > 0 {
+		return limit
+	}
+	if caps, ok := knownCapabilities[normalized]; ok && caps.MaxInputTokens > 0 {
+		return caps.MaxInputTokens
+	}
+	return def
+}
+
+// familyContextLimit applies the Claude family rules to an already-normalized id,
+// returning 0 when no rule matches.
+//
+// These rules deliberately outrank any catalog-reported window: Kiro serves the
+// larger window for the "[1m]" client suffix, which NormalizeModelName has
+// already stripped by the time the limit is computed.
+func familyContextLimit(normalized string) int {
 	family := ExtractModelFamily(normalized)
 	if family == "" {
-		return def
+		return 0
 	}
 	major, minor := modelVersion(normalized)
 	switch family {
@@ -72,7 +149,7 @@ func ContextLimitFor(modelID string, def int) int {
 			return contextWindow200K
 		}
 	}
-	return def
+	return 0
 }
 
 // modelVersion extracts the first major(.minor) version number from a normalized
@@ -172,6 +249,45 @@ func NewResolver(cache Cache, hidden, aliases map[string]string, hiddenFromList 
 		aliases = map[string]string{}
 	}
 	return &Resolver{cache: cache, hiddenModels: hidden, aliases: aliases, hiddenFromList: hfl}
+}
+
+// autoModelID is Kiro's server-side router. Its catalog window describes the
+// best case across whatever it dispatches to, so it is deliberately treated as
+// "unknown": a client that trusts an optimistic window overflows upstream,
+// whereas an unknown one only makes the client compact earlier.
+const autoModelID = "auto"
+
+// Capabilities returns the token limits for modelID, preferring what Kiro
+// reported in the live catalog over the offline table (CapabilitiesFor). The
+// name is resolved first (aliases, bare families, hidden models), so the lookup
+// uses the id Kiro itself knows.
+//
+// ok is false for an unknown model and for the "auto" router, letting the caller
+// keep its own conservative default.
+func (r *Resolver) Capabilities(modelID string) (Capabilities, bool) {
+	id := r.Resolve(modelID).InternalID
+	if id == autoModelID {
+		return Capabilities{}, false
+	}
+	if r.cache != nil {
+		if caps, ok := r.cache.Capabilities(id); ok {
+			return caps, true
+		}
+	}
+	return CapabilitiesFor(id)
+}
+
+// ContextLimitFor returns the input-context window for modelID, falling back to
+// def. It prefers the Claude family rules (see the package-level
+// ContextLimitFor), then the live catalog, then the offline table.
+func (r *Resolver) ContextLimitFor(modelID string, def int) int {
+	if limit := familyContextLimit(NormalizeModelName(modelID)); limit > 0 {
+		return limit
+	}
+	if caps, ok := r.Capabilities(modelID); ok && caps.MaxInputTokens > 0 {
+		return caps.MaxInputTokens
+	}
+	return def
 }
 
 // Resolve never errors — unknown models pass through to Kiro.

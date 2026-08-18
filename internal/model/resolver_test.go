@@ -49,7 +49,12 @@ func TestExtractModelFamily(t *testing.T) {
 	}
 }
 
-type fakeCache struct{ ids []string }
+// fakeCache is a Cache whose catalog is a plain id list, plus an optional
+// per-id capability map standing in for what Kiro reported.
+type fakeCache struct {
+	ids  []string
+	caps map[string]Capabilities
+}
 
 func (f fakeCache) IsValidModel(n string) bool {
 	for _, id := range f.ids {
@@ -60,6 +65,10 @@ func (f fakeCache) IsValidModel(n string) bool {
 	return false
 }
 func (f fakeCache) GetAllModelIDs() []string { return f.ids }
+func (f fakeCache) Capabilities(n string) (Capabilities, bool) {
+	caps, ok := f.caps[n]
+	return caps, ok
+}
 
 func TestContextLimitFor(t *testing.T) {
 	// def is intentionally distinct from any known window so the fallback branch
@@ -96,7 +105,7 @@ func TestContextLimitFor(t *testing.T) {
 		{"claude-3-5-haiku", def},
 		{"claude-haiku-3.5", def},
 		{"claude-opus-3", def},
-		// Non-Claude / unknown → def.
+		// Non-Claude models absent from the capability table → def.
 		{"gpt-4", def},
 		{"glm-5", def},
 		{"", def},
@@ -105,6 +114,122 @@ func TestContextLimitFor(t *testing.T) {
 		if got := ContextLimitFor(c.in, def); got != c.want {
 			t.Errorf("ContextLimitFor(%q, %d) = %d, want %d", c.in, def, got, c.want)
 		}
+	}
+}
+
+func TestContextLimitForCatalogModels(t *testing.T) {
+	// Models the offline capability table knows resolve to their real window
+	// instead of the caller's generic default.
+	const def = 12345
+	cases := []struct {
+		in   string
+		want int
+	}{
+		// Kiro serves 272k for every GPT-5.6 tier
+		// (https://kiro.dev/changelog/models/gpt-5-6/).
+		{"gpt-5.6-sol", 272_000},
+		{"gpt-5.6-terra", 272_000},
+		{"gpt-5.6-luna", 272_000},
+		{"qwen3-coder-next", 256_000},
+		{"minimax-m2.5", 196_000},
+		// Matching is exact: a neighbouring GPT id must not inherit Sol's window.
+		{"gpt-5.6", def},
+		{"gpt-5.6-sol-preview", def},
+		{"gpt-5", def},
+		// The "auto" router's window depends on what it dispatches to, so it is
+		// deliberately unknown.
+		{"auto", def},
+	}
+	for _, c := range cases {
+		if got := ContextLimitFor(c.in, def); got != c.want {
+			t.Errorf("ContextLimitFor(%q, %d) = %d, want %d", c.in, def, got, c.want)
+		}
+	}
+}
+
+func TestCapabilitiesFor(t *testing.T) {
+	caps, ok := CapabilitiesFor("gpt-5.6-sol")
+	if !ok || caps.MaxInputTokens != 272_000 || caps.MaxOutputTokens != 128_000 {
+		t.Errorf("CapabilitiesFor(sol) = %+v, %v; want 272000/128000, true", caps, ok)
+	}
+	// Normalization runs first, so client suffixes and date stamps still hit.
+	if caps, ok := CapabilitiesFor("claude-opus-4-8[1m]"); !ok || caps.MaxOutputTokens != 128_000 {
+		t.Errorf("CapabilitiesFor(opus-4-8[1m]) = %+v, %v; want 128000 output, true", caps, ok)
+	}
+	// Unknown ids report a miss rather than a zero-valued limit.
+	for _, id := range []string{"gpt-5.6", "glm-5", "auto", ""} {
+		if caps, ok := CapabilitiesFor(id); ok {
+			t.Errorf("CapabilitiesFor(%q) = %+v, true; want miss", id, caps)
+		}
+	}
+}
+
+func TestResolverCapabilitiesPrefersLiveCatalog(t *testing.T) {
+	// The live catalog is authoritative: a model Kiro re-tiers is picked up
+	// without a code change, and a model missing from it falls back to the
+	// offline table.
+	r := NewResolver(
+		fakeCache{
+			ids: []string{"gpt-5.6-sol", "claude-opus-5", "glm-5", "auto"},
+			caps: map[string]Capabilities{
+				"gpt-5.6-sol": {MaxInputTokens: 400_000, MaxOutputTokens: 200_000},
+				"glm-5":       {MaxInputTokens: 131_072, MaxOutputTokens: 32_768},
+				"auto":        {MaxInputTokens: 1_000_000, MaxOutputTokens: 64_000},
+			},
+		},
+		nil,
+		map[string]string{"auto-kiro": "auto"},
+		[]string{"auto"},
+	)
+
+	if caps, ok := r.Capabilities("gpt-5.6-sol"); !ok || caps.MaxInputTokens != 400_000 || caps.MaxOutputTokens != 200_000 {
+		t.Errorf("live catalog ignored: %+v, %v", caps, ok)
+	}
+	// Reported only by the catalog, absent from the offline table.
+	if caps, ok := r.Capabilities("glm-5"); !ok || caps.MaxInputTokens != 131_072 {
+		t.Errorf("catalog-only model = %+v, %v; want 131072, true", caps, ok)
+	}
+	// In the catalog but with no limits reported → offline table.
+	if caps, ok := r.Capabilities("claude-opus-5"); !ok || caps.MaxInputTokens != 1_000_000 {
+		t.Errorf("offline fallback = %+v, %v; want 1000000, true", caps, ok)
+	}
+	// The "auto" router stays unknown even when the catalog reports a window,
+	// including through its alias.
+	for _, id := range []string{"auto", "auto-kiro"} {
+		if caps, ok := r.Capabilities(id); ok {
+			t.Errorf("Capabilities(%q) = %+v, true; want miss", id, caps)
+		}
+	}
+	// Unknown to both → miss, so the caller keeps its own default.
+	if caps, ok := r.Capabilities("mystery-model"); ok {
+		t.Errorf("Capabilities(mystery) = %+v, true; want miss", caps)
+	}
+}
+
+func TestResolverContextLimitFor(t *testing.T) {
+	const def = 12345
+	r := NewResolver(
+		fakeCache{
+			ids: []string{"gpt-5.6-sol", "claude-opus-4.8"},
+			caps: map[string]Capabilities{
+				"gpt-5.6-sol": {MaxInputTokens: 272_000, MaxOutputTokens: 128_000},
+				// Kiro reports the smaller window here because the 1M window is
+				// requested via the "[1m]" client suffix, which normalization
+				// strips. The family rule must therefore outrank the catalog.
+				"claude-opus-4.8": {MaxInputTokens: 200_000, MaxOutputTokens: 128_000},
+			},
+		},
+		nil, nil, nil,
+	)
+
+	if got := r.ContextLimitFor("gpt-5.6-sol", def); got != 272_000 {
+		t.Errorf("ContextLimitFor(sol) = %d, want 272000", got)
+	}
+	if got := r.ContextLimitFor("claude-opus-4-8[1m]", def); got != 1_000_000 {
+		t.Errorf("family rule lost to catalog: got %d, want 1000000", got)
+	}
+	if got := r.ContextLimitFor("mystery-model", def); got != def {
+		t.Errorf("ContextLimitFor(mystery) = %d, want %d", got, def)
 	}
 }
 

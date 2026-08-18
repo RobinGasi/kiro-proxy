@@ -14,7 +14,6 @@ import (
 	"git.gasi.dev/robin/kiro-proxy/internal/converter"
 	"git.gasi.dev/robin/kiro-proxy/internal/debuglog"
 	"git.gasi.dev/robin/kiro-proxy/internal/mcp"
-	"git.gasi.dev/robin/kiro-proxy/internal/model"
 	"git.gasi.dev/robin/kiro-proxy/internal/payloadguard"
 	"git.gasi.dev/robin/kiro-proxy/internal/streaming"
 	"git.gasi.dev/robin/kiro-proxy/internal/tokenizer"
@@ -153,7 +152,7 @@ func (h *Handler) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return h.upstream.SendConversation(ctx, am, payload, req.Stream)
 	}
 
-	contextLimit := model.ContextLimitFor(res.Normalized, h.cfg.DefaultMaxInputTokens)
+	contextLimit := acct.Resolver().ContextLimitFor(req.Model, h.cfg.DefaultMaxInputTokens)
 	asReasoning := asReasoningContent(h.cfg.FakeReasoningHandling)
 
 	if req.Stream {

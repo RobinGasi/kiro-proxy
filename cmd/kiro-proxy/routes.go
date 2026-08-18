@@ -11,6 +11,7 @@ import (
 	"git.gasi.dev/robin/kiro-proxy/internal/api/openai"
 	"git.gasi.dev/robin/kiro-proxy/internal/config"
 	"git.gasi.dev/robin/kiro-proxy/internal/mcp"
+	"git.gasi.dev/robin/kiro-proxy/internal/model"
 	"git.gasi.dev/robin/kiro-proxy/internal/transport"
 	"git.gasi.dev/robin/kiro-proxy/internal/upstream"
 )
@@ -42,7 +43,7 @@ func buildDeps(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*d
 		logger.Error("account manager init failed; /v1 routes will return 503 until fixed", "err", err)
 	}
 	if accounts != nil {
-		accounts.SetModelFetcher(func(ctx context.Context, a *account.Account) ([]string, error) {
+		accounts.SetModelFetcher(func(ctx context.Context, a *account.Account) ([]model.CatalogModel, error) {
 			return up.ListAvailableModels(ctx, a.Auth())
 		})
 	}
