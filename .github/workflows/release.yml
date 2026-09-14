@@ -60,7 +60,7 @@ jobs:
         id: release-state
         env:
           NEW_TAG: ${{ steps.semrel.outputs.new_release_git_tag }}
-          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY_USER: ${{ github.repository_owner }}
           REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
         run: |
           tag="$NEW_TAG"
@@ -78,11 +78,10 @@ jobs:
           fi
 
           release_status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
-            --header "Authorization: token $GITEA_TOKEN" \
             "https://git.gasi.dev/api/v1/repos/${GITHUB_REPOSITORY}/releases/tags/$tag")"
           image_tag="${tag#v}"
           image_status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
-            --user "${GITHUB_REPOSITORY_OWNER}:$REGISTRY_TOKEN" \
+            --user "${REGISTRY_USER}:$REGISTRY_TOKEN" \
             --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
             "https://git.gasi.dev/v2/${GITHUB_REPOSITORY}/manifests/$image_tag")"
           case "$release_status" in 200|404) ;; *) echo "Unexpected release status: $release_status" >&2; exit 1 ;; esac
