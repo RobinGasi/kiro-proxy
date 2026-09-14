@@ -99,7 +99,7 @@ func New(hc *http.Client, cfg *config.Config, log *slog.Logger) *Client {
 // apart from a recoverable subscription gap.
 func (c *Client) SendConversation(ctx context.Context, am AuthProvider, payload []byte, stream bool) (*http.Response, error) {
 	url := am.APIHost() + generateAssistantResponsePath
-	return c.doWithRetry(ctx, am, stream, func(token string) (*http.Request, error) {
+	return c.doWithRetry(ctx, am, "conversation", stream, func(token string) (*http.Request, error) {
 		return http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	})
 }
@@ -119,7 +119,7 @@ func (c *Client) SendConversation(ctx context.Context, am AuthProvider, payload 
 // upstream detail (message and reason) rather than masking it.
 func (c *Client) ListAvailableModels(ctx context.Context, am AuthProvider) ([]model.CatalogModel, error) {
 	url := am.QHost() + listAvailableModelsPath
-	resp, err := c.doWithRetry(ctx, am, false, func(token string) (*http.Request, error) {
+	resp, err := c.doWithRetry(ctx, am, "model_catalog", false, func(token string) (*http.Request, error) {
 		req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if rerr != nil {
 			return nil, rerr
@@ -197,9 +197,9 @@ func tokenCount(n json.Number) int {
 
 // doWithRetry runs build (which produces a fresh request for the current token)
 // under the shared retry/backoff/403-refresh policy and returns the resulting
-// response. The returned response (success or exhausted 429/5xx) has its Body
-// readable; the caller owns closing it.
-func (c *Client) doWithRetry(ctx context.Context, am AuthProvider, stream bool, build func(token string) (*http.Request, error)) (*http.Response, error) {
+// response. operation is a safe low-cardinality label such as "conversation" or
+// "model_catalog". The returned response has an open body owned by the caller.
+func (c *Client) doWithRetry(ctx context.Context, am AuthProvider, operation string, stream bool, build func(token string) (*http.Request, error)) (*http.Response, error) {
 	maxRetries := c.cfg.MaxRetries
 	if stream {
 		maxRetries = c.cfg.FirstTokenMaxRetries
@@ -236,36 +236,55 @@ func (c *Client) doWithRetry(ctx context.Context, am AuthProvider, stream bool, 
 			req.Close = true
 		}
 
+		requestStarted := time.Now()
 		resp, err := c.hc.Do(req)
+		duration := time.Since(requestStarted)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
 			lastErr = err
 			if !isRetryableNetErr(err) {
+				c.log.ErrorContext(ctx, "upstream transport error",
+					"req_id", util.RequestID(ctx), "operation", operation, "stream", stream,
+					"attempt", attempt+1, "max", maxRetries,
+					"duration_ms", duration.Milliseconds(), "retryable", false,
+					"error_type", fmt.Sprintf("%T", err), "err", err)
 				break
 			}
 			if attempt == maxRetries-1 {
 				break
 			}
 			delay := c.backoff(attempt)
-			c.log.Warn("upstream network error, backing off",
-				"attempt", attempt+1, "max", maxRetries, "delay", delay, "err", err)
+			c.log.WarnContext(ctx, "upstream network error, backing off",
+				"req_id", util.RequestID(ctx), "operation", operation, "stream", stream,
+				"attempt", attempt+1, "max", maxRetries,
+				"duration_ms", duration.Milliseconds(), "delay", delay,
+				"error_type", fmt.Sprintf("%T", err), "err", err)
 			if serr := sleepCtx(ctx, delay); serr != nil {
 				return nil, serr
 			}
 			continue
 		}
 
+		responseAttrs := []any{
+			"req_id", util.RequestID(ctx), "operation", operation, "stream", stream,
+			"attempt", attempt + 1, "max", maxRetries,
+			"status", resp.StatusCode, "duration_ms", duration.Milliseconds(),
+			"content_type", resp.Header.Get("Content-Type"),
+			"content_length", resp.ContentLength,
+			"upstream_request_id", util.UpstreamRequestID(resp.Header),
+		}
+
 		switch {
 		case resp.StatusCode == http.StatusOK:
+			c.log.DebugContext(ctx, "upstream response accepted", responseAttrs...)
 			return resp, nil
 
 		case resp.StatusCode == http.StatusForbidden:
 			// Token expired/invalid: refresh and retry with the new token.
 			drain(resp)
-			c.log.Warn("upstream returned 403, refreshing token",
-				"attempt", attempt+1, "max", maxRetries)
+			c.log.WarnContext(ctx, "upstream returned 403, refreshing token", responseAttrs...)
 			if _, rerr := am.ForceRefresh(ctx); rerr != nil {
 				return nil, fmt.Errorf("token refresh after 403: %w", rerr)
 			}
@@ -284,8 +303,8 @@ func (c *Client) doWithRetry(ctx context.Context, am AuthProvider, stream bool, 
 				break
 			}
 			delay := c.backoff(attempt)
-			c.log.Warn("upstream returned retryable status, backing off",
-				"status", resp.StatusCode, "attempt", attempt+1, "max", maxRetries, "delay", delay)
+			responseAttrs = append(responseAttrs, "delay", delay)
+			c.log.WarnContext(ctx, "upstream returned retryable status, backing off", responseAttrs...)
 			if serr := sleepCtx(ctx, delay); serr != nil {
 				return nil, serr
 			}
@@ -294,6 +313,7 @@ func (c *Client) doWithRetry(ctx context.Context, am AuthProvider, stream bool, 
 		default:
 			// Any other status (e.g. 400) is returned untouched so the caller can
 			// read and classify the upstream error body (Bug #4).
+			c.log.WarnContext(ctx, "upstream returned terminal status", responseAttrs...)
 			return resp, nil
 		}
 	}
@@ -301,11 +321,18 @@ func (c *Client) doWithRetry(ctx context.Context, am AuthProvider, stream bool, 
 	// Retries exhausted: prefer returning the last retryable HTTP response (so
 	// the caller sees the real status/body), otherwise surface the last error.
 	if lastResp != nil {
-		c.log.Warn("upstream retries exhausted, returning last response",
-			"status", lastResp.StatusCode)
+		c.log.WarnContext(ctx, "upstream retries exhausted, returning last response",
+			"req_id", util.RequestID(ctx), "operation", operation, "stream", stream, "attempts", maxRetries,
+			"status", lastResp.StatusCode,
+			"content_type", lastResp.Header.Get("Content-Type"),
+			"content_length", lastResp.ContentLength,
+			"upstream_request_id", util.UpstreamRequestID(lastResp.Header))
 		return lastResp, nil
 	}
 	if lastErr != nil {
+		c.log.ErrorContext(ctx, "upstream retries exhausted after transport errors",
+			"req_id", util.RequestID(ctx), "operation", operation, "stream", stream, "attempts", maxRetries,
+			"error_type", fmt.Sprintf("%T", lastErr), "err", lastErr)
 		return nil, fmt.Errorf("request failed after %d attempt(s): %w", maxRetries, lastErr)
 	}
 	return nil, fmt.Errorf("request failed after %d attempt(s)", maxRetries)

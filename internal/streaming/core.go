@@ -17,6 +17,7 @@ package streaming
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -30,6 +31,7 @@ import (
 	"git.gasi.dev/robin/kiro-proxy/internal/debuglog"
 	"git.gasi.dev/robin/kiro-proxy/internal/thinking"
 	"git.gasi.dev/robin/kiro-proxy/internal/tokenizer"
+	"git.gasi.dev/robin/kiro-proxy/internal/util"
 )
 
 // Default streaming timeouts, applied when the corresponding config value is
@@ -151,6 +153,39 @@ func (e *UpstreamStatusError) Error() string {
 	return fmt.Sprintf("upstream API error (%d): %s", e.StatusCode, e.Body)
 }
 
+// UpstreamStreamError reports an HTTP 200 response that ended with an embedded
+// upstream exception or without any recognized Kiro event. Kiro can encode
+// model/capacity failures in the event stream instead of the HTTP status.
+type UpstreamStreamError struct {
+	Message string
+	Reason  string
+	// BeforeFirstEvent is true when no recognized event was emitted, making the
+	// request safe to retry without duplicating client-visible output.
+	BeforeFirstEvent  bool
+	BytesRead         int64
+	ChunksRead        int
+	RecognizedEvents  int
+	UnmatchedBytes    int
+	Termination       string
+	Duration          time.Duration
+	ContentType       string
+	ContentLength     int64
+	UpstreamRequestID string
+}
+
+func (e *UpstreamStreamError) Error() string {
+	if e.Message != "" && e.Reason != "" {
+		return fmt.Sprintf("%s (reason: %s)", e.Message, e.Reason)
+	}
+	if e.Message != "" {
+		return e.Message
+	}
+	if e.Reason != "" {
+		return e.Reason
+	}
+	return "upstream stream ended without any recognized events"
+}
+
 // StreamOptions tunes the streaming driver.
 type StreamOptions struct {
 	// EnableThinkingParser toggles fake-reasoning (thinking-tag) parsing for this
@@ -169,9 +204,7 @@ type StreamOptions struct {
 // stream is committed; later stalls surface as StreamingReadTimeoutError without
 // retry.
 //
-// The events channel is closed when the stream ends. After it closes, callers
-// must read the error channel: a nil/absent value means success, otherwise it
-// carries the terminal error (FirstTokenTimeoutError exhaustion,
+// carries the terminal error (first-event retry exhaustion,
 // StreamingReadTimeoutError, UpstreamStatusError, or a transport error).
 //
 // Thinking-tag parsing is enabled (subject to cfg.FakeReasoningEnabled). Use
@@ -210,8 +243,9 @@ func StreamWithFirstTokenRetryOpts(ctx context.Context, cfg *config.Config, star
 				return
 			}
 			if attempt > 0 {
-				slog.Warn("streaming: retry after first token timeout",
-					"attempt", attempt+1, "max", maxRetries)
+				slog.WarnContext(ctx, "streaming: retry before first event",
+					"req_id", util.RequestID(ctx), "attempt", attempt+1, "max", maxRetries,
+					"previous_error_type", fmt.Sprintf("%T", lastErr))
 			}
 
 			resp, err := start(ctx)
@@ -221,13 +255,17 @@ func StreamWithFirstTokenRetryOpts(ctx context.Context, cfg *config.Config, star
 			}
 
 			if resp.StatusCode != http.StatusOK {
-				body, _ := io.ReadAll(resp.Body)
+				body, readErr := io.ReadAll(resp.Body)
 				_ = resp.Body.Close()
-				// Record the upstream error body verbatim: for a Kiro 400 this is
-				// the only place the real reason appears.
+				// The body is retained in DEBUG_MODE artifacts and returned to the
+				// client, but never printed in normal logs because it may contain data.
 				debuglog.FromContext(ctx).LogRawChunk(body)
-				slog.ErrorContext(ctx, "streaming: upstream error",
-					"status", resp.StatusCode, "body", string(body))
+				slog.ErrorContext(ctx, "streaming: upstream HTTP error",
+					"req_id", util.RequestID(ctx), "attempt", attempt+1, "max", maxRetries,
+					"status", resp.StatusCode, "body_bytes", len(body), "body_read_error", readErr,
+					"content_type", resp.Header.Get("Content-Type"),
+					"content_length", resp.ContentLength,
+					"upstream_request_id", util.UpstreamRequestID(resp.Header))
 				errc <- &UpstreamStatusError{StatusCode: resp.StatusCode, Body: string(body)}
 				return
 			}
@@ -238,25 +276,88 @@ func StreamWithFirstTokenRetryOpts(ctx context.Context, cfg *config.Config, star
 			}
 
 			var fte *FirstTokenTimeoutError
-			if errors.As(err, &fte) {
+			var use *UpstreamStreamError
+			if errors.As(err, &fte) || (errors.As(err, &use) && use.BeforeFirstEvent) {
 				lastErr = err
-				slog.Warn("streaming: first token timeout",
-					"attempt", attempt+1, "max", maxRetries, "timeout", firstTokenTimeout)
-				continue // retry with a fresh request
+				attrs := []any{
+					"req_id", util.RequestID(ctx), "attempt", attempt + 1, "max", maxRetries,
+					"error_type", fmt.Sprintf("%T", err),
+				}
+				if use != nil {
+					attrs = append(attrs,
+						"termination", use.Termination, "bytes_read", use.BytesRead,
+						"chunks_read", use.ChunksRead, "recognized_events", use.RecognizedEvents,
+						"unmatched_bytes", use.UnmatchedBytes, "reason", use.Reason,
+						"has_upstream_message", use.Message != "", "duration_ms", use.Duration.Milliseconds(),
+						"content_type", use.ContentType, "content_length", use.ContentLength,
+						"upstream_request_id", use.UpstreamRequestID)
+				}
+				slog.WarnContext(ctx, "streaming: attempt ended before first event", attrs...)
+				continue
 			}
 
-			// Any other error is terminal.
+			// Any other error is terminal; parseKiroStream already logged its safe
+			// termination metrics at the point where the cause was known.
 			errc <- err
 			return
 		}
 
-		slog.Error("streaming: all first-token attempts exhausted",
-			"attempts", maxRetries, "timeout", firstTokenTimeout)
-		errc <- fmt.Errorf("model did not respond within %s after %d attempts: %w",
-			firstTokenTimeout, maxRetries, lastErr)
+		slog.ErrorContext(ctx, "streaming: all first-event attempts exhausted",
+			"req_id", util.RequestID(ctx), "attempts", maxRetries,
+			"last_error_type", fmt.Sprintf("%T", lastErr))
+		var fte *FirstTokenTimeoutError
+		if errors.As(lastErr, &fte) {
+			errc <- fmt.Errorf("model did not respond within %s after %d attempts: %w",
+				firstTokenTimeout, maxRetries, lastErr)
+			return
+		}
+		errc <- fmt.Errorf("upstream stream failed before its first event after %d attempts: %w",
+			maxRetries, lastErr)
 	}()
 
 	return events, errc, nil
+}
+
+type streamAttemptStats struct {
+	started       time.Time
+	bytesRead     int64
+	chunksRead    int
+	contentEvents int
+	usageEvents   int
+	contextEvents int
+	toolEvents    int
+}
+
+func (s *streamAttemptStats) recognizedEvents() int {
+	return s.contentEvents + s.usageEvents + s.contextEvents + s.toolEvents
+}
+
+func streamLogAttrs(ctx context.Context, resp *http.Response, stats *streamAttemptStats, parser *awsstream.Parser, termination string) []any {
+	return []any{
+		"req_id", util.RequestID(ctx), "termination", termination,
+		"duration_ms", time.Since(stats.started).Milliseconds(),
+		"bytes_read", stats.bytesRead, "chunks_read", stats.chunksRead,
+		"recognized_events", stats.recognizedEvents(),
+		"content_events", stats.contentEvents, "usage_events", stats.usageEvents,
+		"context_events", stats.contextEvents, "tool_events", stats.toolEvents,
+		"unmatched_bytes", len(parser.BufferedText()),
+		"status", resp.StatusCode, "content_type", resp.Header.Get("Content-Type"),
+		"content_length", resp.ContentLength,
+		"upstream_request_id", util.UpstreamRequestID(resp.Header),
+	}
+}
+
+func streamFailureClass(stats *streamAttemptStats, parser *awsstream.Parser, message, reason string) string {
+	if message != "" || reason != "" {
+		return "upstream_exception"
+	}
+	if stats.bytesRead == 0 {
+		return "empty_response"
+	}
+	if stats.recognizedEvents() == 0 && len(parser.BufferedText()) > 0 {
+		return "unrecognized_stream"
+	}
+	return "terminal_exception"
 }
 
 // parseKiroStream reads resp.Body in bounded chunks, drives the awsstream and
@@ -272,6 +373,7 @@ func parseKiroStream(ctx context.Context, cfg *config.Config, resp *http.Respons
 
 	parser := awsstream.NewParser()
 	parser.TruncationRecovery = cfg.TruncationRecovery
+	stats := &streamAttemptStats{started: time.Now()}
 
 	var tp *thinking.Parser
 	if opts.EnableThinkingParser {
@@ -317,6 +419,33 @@ func parseKiroStream(ctx context.Context, cfg *config.Config, resp *http.Respons
 	defer close(readerDone)
 
 	firstReceived := false
+	finish := func(termination string) error {
+		toolEvents, err := finalizeStream(ctx, parser, tp, out)
+		if err != nil {
+			return err
+		}
+		stats.toolEvents += toolEvents
+		message, reason := extractStreamError(parser.BufferedText())
+		if message != "" || reason != "" || stats.recognizedEvents() == 0 {
+			failureClass := streamFailureClass(stats, parser, message, reason)
+			attrs := streamLogAttrs(ctx, resp, stats, parser, termination)
+			attrs = append(attrs, "failure_class", failureClass,
+				"reason", reason, "has_upstream_message", message != "")
+			slog.WarnContext(ctx, "streaming: upstream stream ended unsuccessfully", attrs...)
+			return &UpstreamStreamError{
+				Message: message, Reason: reason,
+				BeforeFirstEvent: stats.recognizedEvents() == 0,
+				BytesRead:        stats.bytesRead, ChunksRead: stats.chunksRead,
+				RecognizedEvents: stats.recognizedEvents(), UnmatchedBytes: len(parser.BufferedText()),
+				Termination: termination, Duration: time.Since(stats.started),
+				ContentType: resp.Header.Get("Content-Type"), ContentLength: resp.ContentLength,
+				UpstreamRequestID: util.UpstreamRequestID(resp.Header),
+			}
+		}
+		slog.DebugContext(ctx, "streaming: upstream stream completed",
+			streamLogAttrs(ctx, resp, stats, parser, termination)...)
+		return nil
+	}
 	for {
 		timeout := readTimeout
 		if !firstReceived {
@@ -327,11 +456,18 @@ func parseKiroStream(ctx context.Context, cfg *config.Config, resp *http.Respons
 		select {
 		case <-ctx.Done():
 			timer.Stop()
+			slog.WarnContext(ctx, "streaming: request context ended",
+				append(streamLogAttrs(ctx, resp, stats, parser, "context_done"), "err", ctx.Err())...)
 			return ctx.Err()
 
 		case <-timer.C:
+			termination := "read_timeout"
 			if !firstReceived {
-				slog.Warn("streaming: first token timeout", "timeout", firstTokenTimeout)
+				termination = "first_event_timeout"
+			}
+			slog.WarnContext(ctx, "streaming: upstream stream timed out",
+				append(streamLogAttrs(ctx, resp, stats, parser, termination), "timeout", timeout)...)
+			if !firstReceived {
 				return &FirstTokenTimeoutError{Timeout: firstTokenTimeout}
 			}
 			return &StreamingReadTimeoutError{Timeout: readTimeout}
@@ -339,19 +475,22 @@ func parseKiroStream(ctx context.Context, cfg *config.Config, resp *http.Respons
 		case rc, ok := <-chunks:
 			timer.Stop()
 			if !ok {
-				// Reader closed without a sentinel error; treat as EOF.
-				return finalizeStream(ctx, parser, tp, out)
+				return finish("reader_closed")
 			}
 			if rc.err != nil {
 				if rc.err == io.EOF {
-					// EOF before any byte is a normal empty response.
-					return finalizeStream(ctx, parser, tp, out)
+					return finish("eof")
 				}
+				slog.WarnContext(ctx, "streaming: upstream body read failed",
+					append(streamLogAttrs(ctx, resp, stats, parser, "read_error"),
+						"error_type", fmt.Sprintf("%T", rc.err), "err", rc.err)...)
 				return rc.err
 			}
 			firstReceived = true
+			stats.bytesRead += int64(len(rc.data))
+			stats.chunksRead++
 			dbg.LogRawChunk(rc.data)
-			if err := processChunk(ctx, parser, tp, rc.data, out); err != nil {
+			if err := processChunk(ctx, parser, tp, rc.data, out, stats); err != nil {
 				return err
 			}
 		}
@@ -360,10 +499,11 @@ func parseKiroStream(ctx context.Context, cfg *config.Config, resp *http.Respons
 
 // processChunk feeds a raw chunk to the awsstream parser and emits the resulting
 // unified events, routing content through the thinking parser when enabled.
-func processChunk(ctx context.Context, parser *awsstream.Parser, tp *thinking.Parser, chunk []byte, out chan<- KiroEvent) error {
+func processChunk(ctx context.Context, parser *awsstream.Parser, tp *thinking.Parser, chunk []byte, out chan<- KiroEvent, stats *streamAttemptStats) error {
 	for _, ev := range parser.Feed(chunk) {
 		switch ev.Type {
 		case awsstream.EventContent:
+			stats.contentEvents++
 			content, _ := ev.Data.(string)
 			if tp != nil {
 				res := tp.Feed(content)
@@ -384,18 +524,18 @@ func processChunk(ctx context.Context, parser *awsstream.Parser, tp *thinking.Pa
 						return err
 					}
 				}
-			} else {
-				if err := send(ctx, out, KiroEvent{Type: EventContent, Content: content}); err != nil {
-					return err
-				}
+			} else if err := send(ctx, out, KiroEvent{Type: EventContent, Content: content}); err != nil {
+				return err
 			}
 
 		case awsstream.EventUsage:
+			stats.usageEvents++
 			if err := send(ctx, out, KiroEvent{Type: EventUsage, Usage: usageToMap(ev.Data)}); err != nil {
 				return err
 			}
 
 		case awsstream.EventContextUsage:
+			stats.contextEvents++
 			if err := send(ctx, out, KiroEvent{Type: EventContextUsage, ContextUsagePercentage: toFloat(ev.Data)}); err != nil {
 				return err
 			}
@@ -405,8 +545,9 @@ func processChunk(ctx context.Context, parser *awsstream.Parser, tp *thinking.Pa
 }
 
 // finalizeStream flushes any trailing thinking content and emits the
-// reconstructed tool calls once the stream has ended.
-func finalizeStream(ctx context.Context, parser *awsstream.Parser, tp *thinking.Parser, out chan<- KiroEvent) error {
+// reconstructed tool calls once the stream has ended. The returned count covers
+// tool calls recognized without producing an Event from Parser.Feed.
+func finalizeStream(ctx context.Context, parser *awsstream.Parser, tp *thinking.Parser, out chan<- KiroEvent) (int, error) {
 	if tp != nil {
 		fin := tp.Finalize()
 		if fin.ThinkingContent != "" {
@@ -417,28 +558,65 @@ func finalizeStream(ctx context.Context, parser *awsstream.Parser, tp *thinking.
 					IsFirstThinkingChunk: fin.IsFirstThinkingChunk,
 					IsLastThinkingChunk:  fin.IsLastThinkingChunk,
 				}); err != nil {
-					return err
+					return 0, err
 				}
 			}
 		}
 		if fin.RegularContent != "" {
 			if err := send(ctx, out, KiroEvent{Type: EventContent, Content: fin.RegularContent}); err != nil {
-				return err
+				return 0, err
 			}
 		}
 	}
 
-	for _, tc := range parser.GetToolCalls() {
+	toolCalls := parser.GetToolCalls()
+	for _, tc := range toolCalls {
 		tc := tc
 		if err := send(ctx, out, KiroEvent{
 			Type:     EventToolUse,
 			ToolUse:  toolCallToMap(tc),
 			ToolCall: &tc,
 		}); err != nil {
-			return err
+			return len(toolCalls), err
 		}
 	}
-	return nil
+	return len(toolCalls), nil
+}
+
+// extractStreamError recovers the useful fields from an exception JSON object
+// embedded in the otherwise binary AWS event-stream envelope.
+func extractStreamError(raw string) (message, reason string) {
+	for offset := 0; offset < len(raw); {
+		rel := strings.IndexByte(raw[offset:], '{')
+		if rel < 0 {
+			break
+		}
+		start := offset + rel
+		end := awsstream.FindMatchingBrace(raw, start)
+		if end < 0 {
+			offset = start + 1
+			continue
+		}
+		var payload map[string]any
+		if json.Unmarshal([]byte(raw[start:end+1]), &payload) == nil {
+			message = firstString(payload, "message", "originalMessage")
+			reason = firstString(payload, "reason", "code", "errorCode")
+			if message != "" || reason != "" {
+				return message, reason
+			}
+		}
+		offset = end + 1
+	}
+	return "", ""
+}
+
+func firstString(payload map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := payload[key].(string); ok && value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // CollectStreamResult consumes the entire event stream into a StreamResult. It

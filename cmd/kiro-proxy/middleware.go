@@ -44,7 +44,8 @@ func requestLogger(next http.Handler, log *slog.Logger, dbg *debuglog.Logger) ht
 			"user_agent", r.UserAgent(),
 		)
 
-		ctx, dreq := dbg.Begin(r.Context(), reqID)
+		ctx := util.WithRequestID(r.Context(), reqID)
+		ctx, dreq := dbg.Begin(ctx, reqID)
 		r = r.WithContext(ctx)
 
 		var body *bodyCapture

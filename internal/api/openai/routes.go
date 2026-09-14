@@ -19,6 +19,7 @@ import (
 	"git.gasi.dev/robin/kiro-proxy/internal/streaming"
 	"git.gasi.dev/robin/kiro-proxy/internal/upstream"
 	"git.gasi.dev/robin/kiro-proxy/internal/usage"
+	"git.gasi.dev/robin/kiro-proxy/internal/util"
 )
 
 // Deps carries the collaborators a Handler needs.
@@ -138,6 +139,10 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	}
 	am := acct.Auth()
 	res := acct.Resolver().Resolve(req.Model)
+	h.log.InfoContext(ctx, "openai: model resolved",
+		"req_id", util.RequestID(ctx), "requested_model", req.Model,
+		"normalized_model", res.Normalized, "resolved_model", res.InternalID,
+		"resolution_source", res.Source, "verified", res.IsVerified, "stream", req.Stream)
 
 	// Web-search wiring (mirrors the Anthropic surface): Path B plus Path A, added
 	// for parity since the mcp package already supports the OpenAI response shape.
@@ -201,16 +206,40 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// The transformed upstream payload is the artifact that explains a Kiro 400,
-	// so it is captured before the request is sent (no-op unless DEBUG_MODE is on).
+	// Capture every payload actually sent. If a bare family name resolves to a
+	// newly advertised model that closes before its first event, later stream
+	// attempts walk older catalog versions. Explicit model IDs never downgrade.
+	currentModelID := res.InternalID
+	attempt := 0
 	debuglog.FromContext(ctx).LogKiroRequestBody(payload)
-
 	start := func(ctx context.Context) (*http.Response, error) {
+		if attempt > 0 {
+			if fallback := acct.Resolver().NextFamilyFallback(req.Model, currentModelID); fallback != "" {
+				nextPayload, _, buildErr := converter.BuildKiroPayload(ctx, h.cfg, convReq, am.ProfileARN(), fallback)
+				if buildErr != nil {
+					return nil, buildErr
+				}
+				h.log.WarnContext(ctx, "openai: retrying bare model with older catalog version",
+					"req_id", util.RequestID(ctx), "stream_attempt", attempt+1,
+					"requested_model", req.Model, "failed_model", currentModelID,
+					"fallback_model", fallback, "fallback_payload_bytes", len(nextPayload))
+				currentModelID = fallback
+				payload = nextPayload
+				debuglog.FromContext(ctx).LogKiroRequestBody(payload)
+			}
+		}
+		attempt++
 		return h.upstream.SendConversation(ctx, am, payload, req.Stream)
 	}
 
 	contextLimit := acct.Resolver().ContextLimitFor(req.Model, h.cfg.DefaultMaxInputTokens)
 	reasoningMode := h.cfg.FakeReasoningHandling
+	h.log.InfoContext(ctx, "openai: upstream request prepared",
+		"req_id", util.RequestID(ctx), "requested_model", req.Model,
+		"resolved_model", currentModelID, "stream", req.Stream,
+		"payload_bytes", len(payload), "message_count", len(req.Messages),
+		"tool_count", len(req.Tools), "context_limit", contextLimit,
+		"reasoning_mode", reasoningMode)
 
 	if req.Stream {
 		h.serveStream(w, r, &req, acct, am, contextLimit, reasoningMode, toolNameReverse, start)

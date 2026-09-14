@@ -342,6 +342,48 @@ func (r *Resolver) latestInFamily(externalModel string) string {
 	return best
 }
 
+// NextFamilyFallback returns the newest cached model in the same family that is
+// older than failedID. It is available only for bare family requests; explicit
+// versions and configured aliases are never rewritten.
+func (r *Resolver) NextFamilyFallback(requested, failedID string) string {
+	if r == nil || r.cache == nil {
+		return ""
+	}
+	if _, aliased := r.aliases[requested]; aliased {
+		return ""
+	}
+	name := reContextSuffix.ReplaceAllString(strings.ToLower(strings.TrimSpace(requested)), "")
+	m := reBareFamily.FindStringSubmatch(name)
+	if m == nil {
+		return ""
+	}
+	family := m[1]
+	failedNormalized := NormalizeModelName(failedID)
+	if ExtractModelFamily(failedNormalized) != family {
+		return ""
+	}
+	failedMajor, failedMinor := modelVersion(failedNormalized)
+	if failedMajor == 0 {
+		return ""
+	}
+
+	best := ""
+	bestMajor, bestMinor := -1, -1
+	for _, id := range r.cache.GetAllModelIDs() {
+		if ExtractModelFamily(id) != family {
+			continue
+		}
+		major, minor := modelVersion(NormalizeModelName(id))
+		if major == 0 || major > failedMajor || (major == failedMajor && minor >= failedMinor) {
+			continue
+		}
+		if major > bestMajor || (major == bestMajor && minor > bestMinor) {
+			bestMajor, bestMinor, best = major, minor, id
+		}
+	}
+	return best
+}
+
 // GetAvailableModels returns the sorted union of cache + hidden + aliases,
 // minus hiddenFromList.
 func (r *Resolver) GetAvailableModels() []string {

@@ -103,6 +103,16 @@ func NewParser() *Parser {
 	return &Parser{}
 }
 
+// BufferedText returns stream text that did not match a supported event. It is
+// used at EOF to recover upstream exception payloads carried inside HTTP 200
+// event streams. Callers should inspect it only after feeding is complete.
+func (p *Parser) BufferedText() string {
+	if p == nil {
+		return ""
+	}
+	return p.buffer
+}
+
 // Feed appends a chunk to the internal buffer and returns any newly completed
 // events. Incomplete JSON is retained for subsequent calls.
 func (p *Parser) Feed(chunk []byte) []Event {

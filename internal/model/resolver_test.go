@@ -309,3 +309,33 @@ func TestResolveBareFamilyToLatest(t *testing.T) {
 		t.Errorf("empty family should pass through, got %q", got)
 	}
 }
+
+func TestNextFamilyFallbackOnlyForBareRequests(t *testing.T) {
+	r := NewResolver(
+		fakeCache{ids: []string{
+			"claude-opus-4.7", "claude-opus-5", "claude-opus-4.8",
+			"claude-sonnet-4.6",
+		}},
+		nil,
+		map[string]string{"stable-opus": "claude-opus-4.8"},
+		nil,
+	)
+
+	cases := []struct {
+		requested string
+		failed    string
+		want      string
+	}{
+		{"opus", "claude-opus-5", "claude-opus-4.8"},
+		{"opus[1m]", "claude-opus-4.8", "claude-opus-4.7"},
+		{"claude-opus", "claude-opus-4.7", ""},
+		{"claude-opus-5", "claude-opus-5", ""},
+		{"stable-opus", "claude-opus-4.8", ""},
+		{"sonnet", "claude-opus-5", ""},
+	}
+	for _, tc := range cases {
+		if got := r.NextFamilyFallback(tc.requested, tc.failed); got != tc.want {
+			t.Errorf("NextFamilyFallback(%q, %q) = %q, want %q", tc.requested, tc.failed, got, tc.want)
+		}
+	}
+}

@@ -3,14 +3,46 @@
 package util
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/user"
 )
+
+type requestIDKey struct{}
+
+// WithRequestID attaches the proxy's safe, short request correlation ID.
+func WithRequestID(ctx context.Context, id string) context.Context {
+	if ctx == nil || id == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, requestIDKey{}, id)
+}
+
+// RequestID returns the proxy request correlation ID, or an empty string when
+// the code is running outside an HTTP request.
+func RequestID(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	id, _ := ctx.Value(requestIDKey{}).(string)
+	return id
+}
+
+// UpstreamRequestID extracts AWS's safe response correlation ID.
+func UpstreamRequestID(h http.Header) string {
+	for _, name := range []string{"x-amzn-requestid", "x-amz-request-id", "x-amzn-request-id"} {
+		if id := h.Get(name); id != "" {
+			return id
+		}
+	}
+	return ""
+}
 
 // MachineFingerprint returns a stable per-installation fingerprint, the SHA256
 // of "{hostname}-{username}-kiro-proxy".
