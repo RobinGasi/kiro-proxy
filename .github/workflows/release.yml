@@ -115,15 +115,45 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.PUBLISH_TOKEN }}
 
-      - name: GoReleaser
+      - name: Install GoReleaser
         if: steps.release-state.outputs.publish == 'true'
         uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
-          version: "~> v2"
-          args: release --clean --release-notes=/tmp/release-notes.md
+          version: v2.18.1
+          install-only: true
+
+      - name: GoReleaser
+        if: steps.release-state.outputs.publish == 'true'
         env:
           # Forgejo also injects GITHUB_TOKEN; force GoReleaser to use Gitea and
           # select the verified publish PAT supplied as GITEA_TOKEN.
           GORELEASER_FORCE_TOKEN: gitea
           GITEA_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
+        run: |
+          proxy_log="$RUNNER_TEMP/gitea-api-proxy.log"
+          release_config="$RUNNER_TEMP/goreleaser.yaml"
+          sed 's#api: https://git.gasi.dev/api/v1#api: http://127.0.0.1:18080/api/v1#' \
+            .goreleaser.yaml > "$release_config"
+
+          python3 .github/scripts/gitea-api-proxy.py > "$proxy_log" 2>&1 &
+          proxy_pid=$!
+          trap 'kill "$proxy_pid" 2>/dev/null || true; cat "$proxy_log"' EXIT
+
+          for attempt in $(seq 1 20); do
+            if curl --fail --silent --show-error http://127.0.0.1:18080/api/v1/version >/dev/null; then
+              break
+            fi
+            if ! kill -0 "$proxy_pid" 2>/dev/null; then
+              echo "Gitea API proxy exited during startup" >&2
+              exit 1
+            fi
+            if [ "$attempt" -eq 20 ]; then
+              echo "Gitea API proxy did not become ready" >&2
+              exit 1
+            fi
+            sleep 0.25
+          done
+
+          goreleaser release --config "$release_config" --clean \
+            --release-notes=/tmp/release-notes.md
