@@ -51,8 +51,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # semantic-release may push the tag before a later publishing step fails.
-      # Always fetch tags, then resume whenever HEAD is tagged but either the
-      # Gitea Release or the versioned container image is still missing.
+      # Always fetch tags; if HEAD is tagged, run the idempotent GoReleaser
+      # publication again. release.mode=replace and mutable image tags make
+      # retries safe without fragile remote-state probes.
       - name: Fetch release tags
         run: git fetch --tags --force
 
@@ -60,9 +61,6 @@ jobs:
         id: release-state
         env:
           NEW_TAG: ${{ steps.semrel.outputs.new_release_git_tag }}
-          REPOSITORY: ${{ github.repository }}
-          REGISTRY_USER: ${{ github.repository_owner }}
-          PUBLISH_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
         run: |
           tag="$NEW_TAG"
           if [ -z "$tag" ]; then
@@ -77,26 +75,9 @@ jobs:
             echo "Release tag $tag does not point at HEAD" >&2
             exit 1
           fi
-
-          release_status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
-            --header "Authorization: token $PUBLISH_TOKEN" \
-            "https://git.gasi.dev/api/v1/repos/${REPOSITORY}/releases/tags/$tag")"
-          image_tag="${tag#v}"
-          image_status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
-            --user "${REGISTRY_USER}:$PUBLISH_TOKEN" \
-            --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
-            "https://git.gasi.dev/v2/${REPOSITORY}/manifests/$image_tag")"
-          case "$release_status" in 200|404) ;; *) echo "Unexpected release status: $release_status" >&2; exit 1 ;; esac
-          case "$image_status" in 200|404) ;; *) echo "Unexpected image status: $image_status" >&2; exit 1 ;; esac
-
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          if [ "$release_status" = 200 ] && [ "$image_status" = 200 ]; then
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "$tag is already fully published"
-          else
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-            echo "Publishing $tag (release HTTP $release_status, image HTTP $image_status)"
-          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+          echo "Publishing $tag"
 
       - name: Release notes to file
         if: steps.release-state.outputs.publish == 'true'
@@ -123,16 +104,16 @@ jobs:
         if: steps.release-state.outputs.publish == 'true'
         uses: docker/setup-buildx-action@v3
 
-      # Push the multi-arch image and create the Gitea Release with the verified
-      # PAT stored as REGISTRY_TOKEN. Forgejo's automatic Actions token does not
-      # have sufficient API/package access on this instance.
+      # Push the multi-arch image and create/replace the Gitea Release with the
+      # fresh PAT stored as PUBLISH_TOKEN. Forgejo's automatic Actions token does
+      # not have sufficient API/package access on this instance.
       - name: Log in to the Gitea container registry
         if: steps.release-state.outputs.publish == 'true'
         uses: docker/login-action@v3
         with:
           registry: git.gasi.dev
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.REGISTRY_TOKEN }}
+          password: ${{ secrets.PUBLISH_TOKEN }}
 
       - name: GoReleaser
         if: steps.release-state.outputs.publish == 'true'
@@ -145,4 +126,4 @@ jobs:
           # Forgejo also injects GITHUB_TOKEN; force GoReleaser to use Gitea and
           # select the verified publish PAT supplied as GITEA_TOKEN.
           GORELEASER_FORCE_TOKEN: gitea
-          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          GITEA_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
