@@ -65,12 +65,48 @@ type Account struct {
 	cache    *modelcache.ModelInfoCache
 	resolver *model.Resolver
 
-	failures        int
-	lastFailureTime time.Time
-	modelsCachedAt  time.Time
-	stats           AccountStats
+	failures         int
+	lastFailureTime  time.Time
+	modelsCachedAt   time.Time
+	stats            AccountStats
+	modelProtections map[string]modelProtectionState
 
 	initialized bool
+}
+
+type modelProtectionState struct {
+	Until         time.Time
+	ProbeInFlight bool
+}
+
+// ModelProtectionError reports a model-specific cooldown opened after Kiro
+// returned an HTTP 200 response with an empty body.
+type ModelProtectionError struct {
+	ModelID       string
+	Until         time.Time
+	ProbeInFlight bool
+}
+
+func (e *ModelProtectionError) Error() string {
+	if e.ProbeInFlight {
+		return fmt.Sprintf(
+			"a half-open probe for Kiro model %q is already in progress; switch models or retry shortly",
+			e.ModelID,
+		)
+	}
+	return fmt.Sprintf(
+		"Kiro returned an empty response for model %q; the proxy paused this model until %s to prevent retry amplification after a possible temporary restriction; switch models or retry after the cooldown",
+		e.ModelID, e.Until.UTC().Format(time.RFC3339),
+	)
+}
+
+// RetryAfterSeconds returns an HTTP Retry-After delta, rounded up.
+func (e *ModelProtectionError) RetryAfterSeconds() int {
+	seconds := int(math.Ceil(time.Until(e.Until).Seconds()))
+	if seconds < 1 {
+		return 1
+	}
+	return seconds
 }
 
 // ID returns the stable account identifier (a resolved file path for
@@ -504,7 +540,10 @@ func (m *Manager) RecordSuccess(a *Account) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.recordSuccessLocked(a)
+}
 
+func (m *Manager) recordSuccessLocked(a *Account) {
 	if a.failures > 0 {
 		a.failures = 0
 	}
@@ -562,6 +601,95 @@ func (m *Manager) RecordFailure(a *Account, status int, reason string) {
 	// via the circuit breaker on the next Pick.
 }
 
+// ProtectModelAfterEmptyResponse opens a model-specific cooldown. Empty HTTP
+// 200 responses can accompany a temporary Kiro restriction; suppressing later
+// upstream calls prevents client retries from amplifying the condition.
+func (m *Manager) ProtectModelAfterEmptyResponse(a *Account, modelID string) *ModelProtectionError {
+	if a == nil || modelID == "" {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cooldown := time.Duration(m.cfg.ModelRestrictionCooldownSeconds) * time.Second
+	if cooldown <= 0 {
+		cooldown = time.Hour
+	}
+	until := time.Now().Add(cooldown)
+	if a.modelProtections == nil {
+		a.modelProtections = make(map[string]modelProtectionState)
+	}
+	state := a.modelProtections[modelID]
+	if state.Until.After(until) {
+		until = state.Until
+	}
+	a.modelProtections[modelID] = modelProtectionState{Until: until}
+	a.stats.TotalRequests++
+	a.stats.FailedRequests++
+	m.dirty = true
+	m.log.Warn("model protection opened after empty upstream response",
+		"id", a.id, "model", modelID, "until", until.UTC().Format(time.RFC3339))
+	return &ModelProtectionError{ModelID: modelID, Until: until}
+}
+
+// ModelProtection returns an active cooldown, or claims the single half-open
+// probe after the cooldown. Concurrent callers stay local until that probe
+// succeeds or releases its claim.
+func (m *Manager) ModelProtection(a *Account, modelID string) *ModelProtectionError {
+	if a == nil || modelID == "" {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	state, ok := a.modelProtections[modelID]
+	if !ok {
+		return nil
+	}
+	now := time.Now()
+	if state.Until.After(now) {
+		return &ModelProtectionError{ModelID: modelID, Until: state.Until}
+	}
+	if state.ProbeInFlight {
+		return &ModelProtectionError{
+			ModelID:       modelID,
+			Until:         now.Add(5 * time.Second),
+			ProbeInFlight: true,
+		}
+	}
+	state.ProbeInFlight = true
+	a.modelProtections[modelID] = state
+	return nil
+}
+
+// ReleaseModelProbe permits another half-open probe after a non-restriction
+// failure prevented the current probe from establishing model health.
+func (m *Manager) ReleaseModelProbe(a *Account, modelID string) {
+	if a == nil || modelID == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	state, ok := a.modelProtections[modelID]
+	if !ok || !state.ProbeInFlight {
+		return
+	}
+	state.ProbeInFlight = false
+	a.modelProtections[modelID] = state
+}
+
+// RecordModelSuccess closes model protection after a successful half-open probe
+// and records the normal account success.
+func (m *Manager) RecordModelSuccess(a *Account, modelID string) {
+	if a == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(a.modelProtections, modelID)
+	m.recordSuccessLocked(a)
+}
+
 // Accounts returns the registered accounts in their stable order. The slice is a
 // copy; the *Account pointers are shared.
 func (m *Manager) Accounts() []*Account {
@@ -613,10 +741,11 @@ type persistedState struct {
 }
 
 type persistedAccountState struct {
-	Failures        int          `json:"failures"`
-	LastFailureTime float64      `json:"last_failure_time"`
-	ModelsCachedAt  float64      `json:"models_cached_at"`
-	Stats           AccountStats `json:"stats"`
+	Failures         int                `json:"failures"`
+	LastFailureTime  float64            `json:"last_failure_time"`
+	ModelsCachedAt   float64            `json:"models_cached_at"`
+	Stats            AccountStats       `json:"stats"`
+	ModelProtections map[string]float64 `json:"model_protections,omitempty"`
 }
 
 // LoadState reads the state file and merges runtime state into already-registered
@@ -651,6 +780,15 @@ func (m *Manager) LoadState() error {
 		a.lastFailureTime = unixToTime(ps.LastFailureTime)
 		a.modelsCachedAt = unixToTime(ps.ModelsCachedAt)
 		a.stats = ps.Stats
+		if len(ps.ModelProtections) > 0 {
+			a.modelProtections = make(map[string]modelProtectionState, len(ps.ModelProtections))
+			for modelID, unix := range ps.ModelProtections {
+				until := unixToTime(unix)
+				if !until.IsZero() {
+					a.modelProtections[modelID] = modelProtectionState{Until: until}
+				}
+			}
+		}
 	}
 	m.log.Info("loaded account state", "accounts", len(st.Accounts))
 	return nil
@@ -665,12 +803,22 @@ func (m *Manager) SaveState() error {
 		Accounts:            make(map[string]persistedAccountState, len(m.accounts)),
 	}
 	for _, a := range m.accounts {
-		st.Accounts[a.id] = persistedAccountState{
+		ps := persistedAccountState{
 			Failures:        a.failures,
 			LastFailureTime: timeToUnix(a.lastFailureTime),
 			ModelsCachedAt:  timeToUnix(a.modelsCachedAt),
 			Stats:           a.stats,
 		}
+		for modelID, state := range a.modelProtections {
+			if state.Until.IsZero() {
+				continue
+			}
+			if ps.ModelProtections == nil {
+				ps.ModelProtections = make(map[string]float64)
+			}
+			ps.ModelProtections[modelID] = timeToUnix(state.Until)
+		}
+		st.Accounts[a.id] = ps
 	}
 	m.dirty = false
 	m.mu.Unlock()

@@ -130,9 +130,10 @@ type Config struct {
 	LogLevel string
 
 	// Streaming timeouts.
-	FirstTokenTimeout    float64
-	StreamingReadTimeout float64
-	FirstTokenMaxRetries int
+	FirstTokenTimeout               float64
+	StreamingReadTimeout            float64
+	FirstTokenMaxRetries            int
+	ModelRestrictionCooldownSeconds int
 
 	// Debug.
 	DebugMode string // off|errors|all
@@ -208,9 +209,10 @@ func Load() *Config {
 
 		LogLevel: strings.ToUpper(getEnv("LOG_LEVEL", "INFO")),
 
-		FirstTokenTimeout:    getEnvFloat("FIRST_TOKEN_TIMEOUT", 15),
-		StreamingReadTimeout: getEnvFloat("STREAMING_READ_TIMEOUT", 300),
-		FirstTokenMaxRetries: getEnvInt("FIRST_TOKEN_MAX_RETRIES", 3),
+		FirstTokenTimeout:               getEnvFloat("FIRST_TOKEN_TIMEOUT", 15),
+		StreamingReadTimeout:            getEnvFloat("STREAMING_READ_TIMEOUT", 300),
+		FirstTokenMaxRetries:            getEnvInt("FIRST_TOKEN_MAX_RETRIES", 3),
+		ModelRestrictionCooldownSeconds: getEnvInt("MODEL_RESTRICTION_COOLDOWN_SECONDS", 3600),
 
 		DebugMode: normalizeEnum(strings.ToLower(getEnv("DEBUG_MODE", "")), []string{"off", "errors", "all"}, "off"),
 		DebugDir:  getEnv("DEBUG_DIR", "debug_logs"),

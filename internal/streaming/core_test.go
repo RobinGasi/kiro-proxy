@@ -2,6 +2,7 @@ package streaming
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -53,18 +54,14 @@ func TestStreamRejectsResponseWithoutRecognizedEvents(t *testing.T) {
 	}
 }
 
-func TestStreamRetriesImmediateEOFBeforeFirstEvent(t *testing.T) {
+func TestStreamDoesNotRetryEmptyResponse(t *testing.T) {
 	attempts := 0
-	cfg := &config.Config{FirstTokenMaxRetries: 2}
+	cfg := &config.Config{FirstTokenMaxRetries: 3}
 	start := func(context.Context) (*http.Response, error) {
 		attempts++
-		body := ""
-		if attempts == 2 {
-			body = `{"content":"recovered"}`
-		}
 		return &http.Response{
 			StatusCode: http.StatusOK,
-			Body:       io.NopCloser(strings.NewReader(body)),
+			Body:       io.NopCloser(strings.NewReader("")),
 		}, nil
 	}
 
@@ -72,15 +69,13 @@ func TestStreamRetriesImmediateEOFBeforeFirstEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start stream: %v", err)
 	}
-	result, err := CollectStreamResult(events, errc)
-	if err != nil {
-		t.Fatalf("collect retried stream: %v", err)
+	_, err = CollectStreamResult(events, errc)
+	var streamErr *UpstreamStreamError
+	if !errors.As(err, &streamErr) || streamErr.BytesRead != 0 {
+		t.Fatalf("error = %v, want zero-byte UpstreamStreamError", err)
 	}
-	if attempts != 2 {
-		t.Fatalf("attempts = %d, want 2", attempts)
-	}
-	if result.Content != "recovered" {
-		t.Fatalf("content = %q, want %q", result.Content, "recovered")
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1; retrying an empty response can amplify an upstream model restriction", attempts)
 	}
 }
 

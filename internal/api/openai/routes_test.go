@@ -2,9 +2,15 @@ package openai
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 
+	"git.gasi.dev/robin/kiro-proxy/internal/account"
 	"git.gasi.dev/robin/kiro-proxy/internal/model"
+	"time"
 )
 
 // TestModelListForCapabilities pins the GET /v1/models contract: a model whose
@@ -52,5 +58,36 @@ func TestModelListForCapabilities(t *testing.T) {
 	unknown := decoded.Data[1]
 	if unknown.ContextWindow != nil || unknown.MaxOutputTokens != nil {
 		t.Errorf("unknown model must omit limits, got %+v", unknown)
+	}
+}
+
+func TestWriteModelProtectionErrorIsNonRetryableUpstream(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	writeModelProtectionError(recorder, &account.ModelProtectionError{
+		ModelID: "claude-opus-5.5",
+		Until:   time.Now().Add(time.Hour),
+	})
+
+	if recorder.Code != http.StatusLocked {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusLocked)
+	}
+	retryAfter, err := strconv.Atoi(recorder.Header().Get("Retry-After"))
+	if err != nil || retryAfter <= 0 {
+		t.Fatalf("Retry-After = %q, want positive seconds", recorder.Header().Get("Retry-After"))
+	}
+	var response struct {
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Error.Type != "kiro_model_temporarily_restricted" {
+		t.Fatalf("error type = %q", response.Error.Type)
+	}
+	if !strings.Contains(response.Error.Message, "switch models") {
+		t.Fatalf("message = %q, want actionable model-switch guidance", response.Error.Message)
 	}
 }

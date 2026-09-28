@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 
 	"git.gasi.dev/robin/kiro-proxy/internal/account"
 	"git.gasi.dev/robin/kiro-proxy/internal/apiauth"
@@ -149,6 +150,11 @@ func (h *Handler) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if protection := h.accounts.ModelProtection(acct, res.InternalID); protection != nil {
+		writeModelProtectionError(w, protection)
+		return
+	}
+
 	// Capture every payload actually sent. If a bare family name resolves to a
 	// newly advertised model that closes before its first event, later stream
 	// attempts walk older catalog versions. Explicit model IDs never downgrade.
@@ -185,18 +191,19 @@ func (h *Handler) handleMessages(w http.ResponseWriter, r *http.Request) {
 		"reasoning_mode", h.cfg.FakeReasoningHandling)
 
 	if req.Stream {
-		h.serveStreaming(ctx, w, &req, acct, am, contextLimit, asReasoning, toolNameReverse, start)
+		h.serveStreaming(ctx, w, &req, acct, am, contextLimit, asReasoning, toolNameReverse, res.InternalID, start)
 		return
 	}
-	h.serveNonStreaming(ctx, w, &req, acct, contextLimit, asReasoning, toolNameReverse, start)
+	h.serveNonStreaming(ctx, w, &req, acct, contextLimit, asReasoning, toolNameReverse, res.InternalID, start)
 }
 
 // serveStreaming drives the SSE response path.
-func (h *Handler) serveStreaming(ctx context.Context, w http.ResponseWriter, req *MessagesRequest, acct *account.Account, am mcp.AuthManager, contextLimit int, asReasoning bool, toolNameReverse map[string]string, start func(context.Context) (*http.Response, error)) {
+func (h *Handler) serveStreaming(ctx context.Context, w http.ResponseWriter, req *MessagesRequest, acct *account.Account, am mcp.AuthManager, contextLimit int, asReasoning bool, toolNameReverse map[string]string, modelID string, start func(context.Context) (*http.Response, error)) {
 	inputTokens := h.estimateInputTokens(req, false)
 
 	evCh, errCh, err := streaming.StreamWithFirstTokenRetry(ctx, h.cfg, start)
 	if err != nil {
+		h.accounts.ReleaseModelProbe(acct, modelID)
 		h.log.Error("failed to start stream", "error", err)
 		writeError(w, http.StatusInternalServerError, "api_error", "Failed to start stream.")
 		return
@@ -204,9 +211,16 @@ func (h *Handler) serveStreaming(ctx context.Context, w http.ResponseWriter, req
 
 	committed, streamErr := h.streamMessages(ctx, w, am, req.Model, inputTokens, contextLimit, asReasoning, toolNameReverse, evCh, errCh)
 	if streamErr == nil {
-		h.accounts.RecordSuccess(acct)
+		h.accounts.RecordModelSuccess(acct, modelID)
 		return
 	}
+	if streaming.IsEmptyResponse(streamErr) {
+		if !committed {
+			writeModelProtectionError(w, h.accounts.ProtectModelAfterEmptyResponse(acct, modelID))
+		}
+		return
+	}
+	h.accounts.ReleaseModelProbe(acct, modelID)
 
 	status, reason, message := classifyUpstreamError(streamErr)
 	h.accounts.RecordFailure(acct, status, reason)
@@ -220,11 +234,12 @@ func (h *Handler) serveStreaming(ctx context.Context, w http.ResponseWriter, req
 }
 
 // serveNonStreaming drives the single-JSON-response path.
-func (h *Handler) serveNonStreaming(ctx context.Context, w http.ResponseWriter, req *MessagesRequest, acct *account.Account, contextLimit int, asReasoning bool, toolNameReverse map[string]string, start func(context.Context) (*http.Response, error)) {
+func (h *Handler) serveNonStreaming(ctx context.Context, w http.ResponseWriter, req *MessagesRequest, acct *account.Account, contextLimit int, asReasoning bool, toolNameReverse map[string]string, modelID string, start func(context.Context) (*http.Response, error)) {
 	inputTokens := h.estimateInputTokens(req, false)
 
 	evCh, errCh, err := streaming.StreamWithFirstTokenRetry(ctx, h.cfg, start)
 	if err != nil {
+		h.accounts.ReleaseModelProbe(acct, modelID)
 		h.log.Error("failed to start stream", "error", err)
 		writeError(w, http.StatusInternalServerError, "api_error", "Failed to start upstream request.")
 		return
@@ -232,6 +247,11 @@ func (h *Handler) serveNonStreaming(ctx context.Context, w http.ResponseWriter, 
 
 	result, err := streaming.CollectStreamResult(evCh, errCh)
 	if err != nil {
+		if streaming.IsEmptyResponse(err) {
+			writeModelProtectionError(w, h.accounts.ProtectModelAfterEmptyResponse(acct, modelID))
+			return
+		}
+		h.accounts.ReleaseModelProbe(acct, modelID)
 		status, reason, message := classifyUpstreamError(err)
 		h.accounts.RecordFailure(acct, status, reason)
 		writeError(w, status, "api_error", message)
@@ -239,13 +259,18 @@ func (h *Handler) serveNonStreaming(ctx context.Context, w http.ResponseWriter, 
 	}
 
 	resp := buildMessagesResponse(result, req.Model, inputTokens, contextLimit, asReasoning, toolNameReverse)
-	h.accounts.RecordSuccess(acct)
+	h.accounts.RecordModelSuccess(acct, modelID)
 	// Mirror the OpenAI surface: surface remaining credits as a response header
 	// when the upstream usage payload carries them (see openai serveNonStream).
 	if rem, ok := creditsRemaining(result.Usage); ok {
 		w.Header().Set("x-kiro-credits-remaining", rem)
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func writeModelProtectionError(w http.ResponseWriter, protection *account.ModelProtectionError) {
+	w.Header().Set("Retry-After", strconv.Itoa(protection.RetryAfterSeconds()))
+	writeError(w, http.StatusLocked, "api_error", protection.Error())
 }
 
 // handleCountTokens implements POST /v1/messages/count_tokens, returning an

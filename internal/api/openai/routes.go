@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"git.gasi.dev/robin/kiro-proxy/internal/account"
@@ -206,6 +207,11 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	if protection := h.accounts.ModelProtection(acct, res.InternalID); protection != nil {
+		writeModelProtectionError(w, protection)
+		return
+	}
+
 	// Capture every payload actually sent. If a bare family name resolves to a
 	// newly advertised model that closes before its first event, later stream
 	// attempts walk older catalog versions. Explicit model IDs never downgrade.
@@ -242,16 +248,17 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		"reasoning_mode", reasoningMode)
 
 	if req.Stream {
-		h.serveStream(w, r, &req, acct, am, contextLimit, reasoningMode, toolNameReverse, start)
+		h.serveStream(w, r, &req, acct, am, contextLimit, reasoningMode, toolNameReverse, res.InternalID, start)
 		return
 	}
-	h.serveNonStream(w, r, &req, acct, contextLimit, reasoningMode, toolNameReverse, start)
+	h.serveNonStream(w, r, &req, acct, contextLimit, reasoningMode, toolNameReverse, res.InternalID, start)
 }
 
 // serveStream drives a streaming response.
-func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, req *ChatCompletionRequest, acct *account.Account, am mcp.AuthManager, contextLimit int, reasoningMode string, toolNameReverse map[string]string, start func(context.Context) (*http.Response, error)) {
+func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, req *ChatCompletionRequest, acct *account.Account, am mcp.AuthManager, contextLimit int, reasoningMode string, toolNameReverse map[string]string, modelID string, start func(context.Context) (*http.Response, error)) {
 	evCh, errCh, err := streaming.StreamWithFirstTokenRetry(r.Context(), h.cfg, start)
 	if err != nil {
+		h.accounts.ReleaseModelProbe(acct, modelID)
 		h.accounts.RecordFailure(acct, http.StatusBadGateway, err.Error())
 		h.writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -262,13 +269,18 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, req *ChatC
 	first, ok := <-evCh
 	if !ok {
 		streamErr := <-errCh
+		if streaming.IsEmptyResponse(streamErr) {
+			writeModelProtectionError(w, h.accounts.ProtectModelAfterEmptyResponse(acct, modelID))
+			return
+		}
+		h.accounts.ReleaseModelProbe(acct, modelID)
 		status, msg := classifyStreamError(streamErr)
 		h.accounts.RecordFailure(acct, status, msg)
 		h.writeError(w, status, msg)
 		return
 	}
 
-	h.accounts.RecordSuccess(acct)
+	h.accounts.RecordModelSuccess(acct, modelID)
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -281,9 +293,10 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, req *ChatC
 }
 
 // serveNonStream drives a non-streaming response.
-func (h *Handler) serveNonStream(w http.ResponseWriter, r *http.Request, req *ChatCompletionRequest, acct *account.Account, contextLimit int, reasoningMode string, toolNameReverse map[string]string, start func(context.Context) (*http.Response, error)) {
+func (h *Handler) serveNonStream(w http.ResponseWriter, r *http.Request, req *ChatCompletionRequest, acct *account.Account, contextLimit int, reasoningMode string, toolNameReverse map[string]string, modelID string, start func(context.Context) (*http.Response, error)) {
 	evCh, errCh, err := streaming.StreamWithFirstTokenRetry(r.Context(), h.cfg, start)
 	if err != nil {
+		h.accounts.ReleaseModelProbe(acct, modelID)
 		h.accounts.RecordFailure(acct, http.StatusBadGateway, err.Error())
 		h.writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -291,13 +304,18 @@ func (h *Handler) serveNonStream(w http.ResponseWriter, r *http.Request, req *Ch
 
 	result, err := streaming.CollectStreamResult(evCh, errCh)
 	if err != nil {
+		if streaming.IsEmptyResponse(err) {
+			writeModelProtectionError(w, h.accounts.ProtectModelAfterEmptyResponse(acct, modelID))
+			return
+		}
+		h.accounts.ReleaseModelProbe(acct, modelID)
 		status, msg := classifyStreamError(err)
 		h.accounts.RecordFailure(acct, status, msg)
 		h.writeError(w, status, msg)
 		return
 	}
 
-	h.accounts.RecordSuccess(acct)
+	h.accounts.RecordModelSuccess(acct, modelID)
 
 	resp := buildNonStreamingResponse(req.Model, contextLimit, reasoningMode, toolNameReverse, result)
 	if rem, ok := creditsRemaining(result.Usage); ok {
@@ -329,6 +347,17 @@ func messagesAsMaps(req *ChatCompletionRequest) []map[string]any {
 		_ = json.Unmarshal(b, &msgs)
 	}
 	return msgs
+}
+
+func writeModelProtectionError(w http.ResponseWriter, protection *account.ModelProtectionError) {
+	w.Header().Set("Retry-After", strconv.Itoa(protection.RetryAfterSeconds()))
+	writeJSON(w, http.StatusLocked, map[string]any{
+		"error": map[string]any{
+			"message": protection.Error(),
+			"type":    "kiro_model_temporarily_restricted",
+			"code":    http.StatusLocked,
+		},
+	})
 }
 
 // classifyStreamError maps a terminal stream error to an HTTP status and a

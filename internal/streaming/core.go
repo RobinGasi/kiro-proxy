@@ -186,6 +186,15 @@ func (e *UpstreamStreamError) Error() string {
 	return "upstream stream ended without any recognized events"
 }
 
+// IsEmptyResponse reports the zero-byte HTTP 200 response Kiro emits when it
+// closes a request before producing any event.
+func IsEmptyResponse(err error) bool {
+	var streamErr *UpstreamStreamError
+	return errors.As(err, &streamErr) &&
+		streamErr.BeforeFirstEvent &&
+		streamErr.BytesRead == 0
+}
+
 // StreamOptions tunes the streaming driver.
 type StreamOptions struct {
 	// EnableThinkingParser toggles fake-reasoning (thinking-tag) parsing for this
@@ -277,7 +286,16 @@ func StreamWithFirstTokenRetryOpts(ctx context.Context, cfg *config.Config, star
 
 			var fte *FirstTokenTimeoutError
 			var use *UpstreamStreamError
-			if errors.As(err, &fte) || (errors.As(err, &use) && use.BeforeFirstEvent) {
+			isFirstTokenTimeout := errors.As(err, &fte)
+			isBeforeFirstEvent := errors.As(err, &use) && use.BeforeFirstEvent
+			if isBeforeFirstEvent && use.BytesRead == 0 {
+				slog.WarnContext(ctx, "streaming: empty upstream response will not be retried",
+					"req_id", util.RequestID(ctx), "attempt", attempt+1,
+					"upstream_request_id", use.UpstreamRequestID)
+				errc <- err
+				return
+			}
+			if isFirstTokenTimeout || isBeforeFirstEvent {
 				lastErr = err
 				attrs := []any{
 					"req_id", util.RequestID(ctx), "attempt", attempt + 1, "max", maxRetries,

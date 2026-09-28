@@ -172,6 +172,11 @@ proxy keys, credential sources, regions, `VPN_PROXY_URL` (HTTP/SOCKS5), logging,
 debug mode, streaming timeouts, fake-reasoning, payload guard, web search, and
 multi-account / circuit-breaker tuning.
 
+Zero-byte upstream responses are not retried. They open a persisted, model-scoped
+cooldown (`MODEL_RESTRICTION_COOLDOWN_SECONDS`, default 3600) and return HTTP 423
+with `Retry-After`; other models remain available. This prevents agent and proxy
+retry loops from repeatedly hitting a possibly restricted Kiro model.
+
 ## Development
 
 ```bash
