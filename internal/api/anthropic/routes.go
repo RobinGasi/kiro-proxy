@@ -270,7 +270,7 @@ func (h *Handler) serveNonStreaming(ctx context.Context, w http.ResponseWriter, 
 
 func writeModelProtectionError(w http.ResponseWriter, protection *account.ModelProtectionError) {
 	w.Header().Set("Retry-After", strconv.Itoa(protection.RetryAfterSeconds()))
-	writeError(w, http.StatusLocked, "api_error", protection.Error())
+	writeError(w, http.StatusServiceUnavailable, "api_error", protection.Error())
 }
 
 // handleCountTokens implements POST /v1/messages/count_tokens, returning an

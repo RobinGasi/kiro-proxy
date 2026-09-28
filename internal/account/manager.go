@@ -79,7 +79,7 @@ type modelProtectionState struct {
 	ProbeInFlight bool
 }
 
-// ModelProtectionError reports a model-specific cooldown opened after Kiro
+// ModelProtectionError reports a model-specific pause opened after Kiro
 // returned an HTTP 200 response with an empty body.
 type ModelProtectionError struct {
 	ModelID       string
@@ -90,12 +90,12 @@ type ModelProtectionError struct {
 func (e *ModelProtectionError) Error() string {
 	if e.ProbeInFlight {
 		return fmt.Sprintf(
-			"a half-open probe for Kiro model %q is already in progress; switch models or retry shortly",
+			"a half-open probe for Kiro model %q is already in progress; use another model or retry shortly",
 			e.ModelID,
 		)
 	}
 	return fmt.Sprintf(
-		"Kiro returned an empty response for model %q; the proxy paused this model until %s to prevent retry amplification after a possible temporary restriction; switch models or retry after the cooldown",
+		"Kiro returned an empty response for model %q; the proxy paused this model until %s to prevent retry amplification; use another model or retry after the cooldown",
 		e.ModelID, e.Until.UTC().Format(time.RFC3339),
 	)
 }
@@ -822,19 +822,27 @@ func (m *Manager) SaveState() error {
 	}
 	m.dirty = false
 	m.mu.Unlock()
+	restoreDirty := func() {
+		m.mu.Lock()
+		m.dirty = true
+		m.mu.Unlock()
+	}
 
 	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
+		restoreDirty()
 		return fmt.Errorf("account: marshal state: %w", err)
 	}
 
 	path := expandUser(m.cfg.AccountsStateFile)
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		restoreDirty()
 		return fmt.Errorf("account: write state temp file: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
+		restoreDirty()
 		return fmt.Errorf("account: rename state file: %w", err)
 	}
 	m.log.Debug("saved account state")

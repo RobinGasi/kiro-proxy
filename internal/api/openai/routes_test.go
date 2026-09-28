@@ -61,15 +61,15 @@ func TestModelListForCapabilities(t *testing.T) {
 	}
 }
 
-func TestWriteModelProtectionErrorIsNonRetryableUpstream(t *testing.T) {
+func TestWriteModelProtectionErrorAllowsClientModelFallback(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	writeModelProtectionError(recorder, &account.ModelProtectionError{
 		ModelID: "claude-opus-5.5",
 		Until:   time.Now().Add(time.Hour),
 	})
 
-	if recorder.Code != http.StatusLocked {
-		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusLocked)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
 	}
 	retryAfter, err := strconv.Atoi(recorder.Header().Get("Retry-After"))
 	if err != nil || retryAfter <= 0 {
@@ -84,10 +84,10 @@ func TestWriteModelProtectionErrorIsNonRetryableUpstream(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if response.Error.Type != "kiro_model_temporarily_restricted" {
+	if response.Error.Type != "kiro_model_temporarily_unavailable" {
 		t.Fatalf("error type = %q", response.Error.Type)
 	}
-	if !strings.Contains(response.Error.Message, "switch models") {
+	if !strings.Contains(response.Error.Message, "use another model") {
 		t.Fatalf("message = %q, want actionable model-switch guidance", response.Error.Message)
 	}
 }

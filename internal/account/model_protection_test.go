@@ -31,7 +31,7 @@ func TestModelProtectionPersistsAndDoesNotBlockOtherModels(t *testing.T) {
 	if protection == nil || protection.RetryAfterSeconds() <= 0 {
 		t.Fatalf("protection = %#v, want active cooldown", protection)
 	}
-	if !strings.Contains(protection.Error(), "switch models") {
+	if !strings.Contains(protection.Error(), "use another model") {
 		t.Fatalf("error = %q, want actionable model-switch guidance", protection)
 	}
 	if got := manager.ModelProtection(acct, "gpt-5.6-sol"); got != nil {
@@ -76,5 +76,22 @@ func TestModelProtectionAllowsSingleHalfOpenProbe(t *testing.T) {
 	manager.RecordModelSuccess(acct, "claude-opus-5.5")
 	if _, ok := acct.modelProtections["claude-opus-5.5"]; ok {
 		t.Fatal("successful half-open probe did not close the breaker")
+	}
+}
+
+func TestSaveStateRemainsDirtyAfterWriteFailure(t *testing.T) {
+	manager := &Manager{
+		cfg: &config.Config{
+			AccountsStateFile: filepath.Join(t.TempDir(), "missing", "state.json"),
+		},
+		log:   slog.New(slog.DiscardHandler),
+		dirty: true,
+	}
+
+	if err := manager.SaveState(); err == nil {
+		t.Fatal("SaveState succeeded with a missing parent directory")
+	}
+	if !manager.isDirty() {
+		t.Fatal("failed state save cleared dirty state and disabled periodic retry")
 	}
 }

@@ -351,11 +351,11 @@ func messagesAsMaps(req *ChatCompletionRequest) []map[string]any {
 
 func writeModelProtectionError(w http.ResponseWriter, protection *account.ModelProtectionError) {
 	w.Header().Set("Retry-After", strconv.Itoa(protection.RetryAfterSeconds()))
-	writeJSON(w, http.StatusLocked, map[string]any{
+	writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 		"error": map[string]any{
 			"message": protection.Error(),
-			"type":    "kiro_model_temporarily_restricted",
-			"code":    http.StatusLocked,
+			"type":    "kiro_model_temporarily_unavailable",
+			"code":    http.StatusServiceUnavailable,
 		},
 	})
 }
