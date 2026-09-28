@@ -43,6 +43,9 @@ func buildDeps(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*d
 		logger.Error("account manager init failed; /v1 routes will return 503 until fixed", "err", err)
 	}
 	if accounts != nil {
+		if err := accounts.LoadState(); err != nil {
+			logger.Warn("account state load failed; starting with fresh runtime state", "error", err)
+		}
 		accounts.SetModelFetcher(func(ctx context.Context, a *account.Account) ([]model.CatalogModel, error) {
 			return up.ListAvailableModels(ctx, a.Auth())
 		})
