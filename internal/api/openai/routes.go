@@ -69,6 +69,13 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusUnauthorized, "Invalid or missing API key")
 		return
 	}
+	// Accounts initialize lazily; Pick makes one ready (fetching Kiro's live
+	// catalog) so a fresh proxy never answers with an empty list that clients
+	// would cache as "no models".
+	if _, err := h.accounts.Pick(r.Context()); err != nil {
+		h.writeError(w, http.StatusServiceUnavailable, "No available accounts")
+		return
+	}
 	writeJSON(w, http.StatusOK, ModelListFor(h.accounts.AllAvailableModels()))
 }
 
