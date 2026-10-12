@@ -106,35 +106,26 @@ describe("fetchModels", () => {
 		}
 	});
 
-	test("falls back to the seed when the proxy errors or serves nothing", async () => {
+	// A rejected fetch is what makes omp retry in minutes; a resolved list is
+	// cached as the catalog for 24 h.
+	test("rejects when the proxy errors or lists nothing", async () => {
 		const failing = await serving({ error: { message: "no accounts" } }, 503);
 		try {
-			const seeded = await fetchModels(failing.baseUrl, undefined);
-			expect(seeded.some((entry) => entry.id === "gpt-5.6-sol")).toBe(true);
-			// The seed carries ids only, so buildModel resolves the limits.
-			expect(seeded.every((entry) => entry.contextWindow === undefined)).toBe(true);
+			await expect(fetchModels(failing.baseUrl, undefined)).rejects.toThrow("503");
 		} finally {
 			failing.stop();
 		}
 
 		const empty = await serving({ object: "list", data: [] });
 		try {
-			expect((await fetchModels(empty.baseUrl, undefined)).length).toBeGreaterThan(0);
+			await expect(fetchModels(empty.baseUrl, undefined)).rejects.toThrow("no models");
 		} finally {
 			empty.stop();
 		}
 	});
 
-	test("falls back to the seed when the proxy is unreachable", async () => {
+	test("rejects when the proxy is unreachable", async () => {
 		// Nothing is listening on this port, so the fetch rejects.
-		const models = await fetchModels("http://127.0.0.1:1/v1", undefined);
-		expect(models.some((entry) => entry.id === "gpt-5.6-sol")).toBe(true);
-	});
-
-	test("cold-start seed still advertises Sol's real window", async () => {
-		const models = await fetchModels("http://127.0.0.1:1/v1", undefined);
-		const sol = models.map(buildModel).find((model) => model.id === "gpt-5.6-sol");
-		expect(sol?.contextWindow).toBe(272_000);
-		expect(sol?.maxTokens).toBe(128_000);
+		await expect(fetchModels("http://127.0.0.1:1/v1", undefined)).rejects.toThrow();
 	});
 });

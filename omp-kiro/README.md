@@ -12,19 +12,20 @@ is handed off to a second agent, so the full omp toolchain stays in play on ever
 
 ## Install
 
+The plugin lives in the [kiro-proxy](https://github.com/RobinGasi/kiro-proxy) repo. Its
+[installer](https://github.com/RobinGasi/kiro-proxy#one-command-install-recommended) sets up the proxy and,
+when `omp` is on your `PATH`, links this plugin too:
+
 ```sh
-omp plugin install github:RobinGasi/omp-kiro
+curl -fsSL https://raw.githubusercontent.com/RobinGasi/kiro-proxy/main/install.sh | bash
 ```
 
-The [kiro-proxy installer](https://github.com/RobinGasi/kiro-proxy#one-command-install-recommended)
-runs this for you when `omp` is on your `PATH`.
-
-Developing on it instead? Clone and link, so edits in the working tree are live:
+Developing on it instead? Link your clone, so edits in the working tree are live:
 
 ```sh
-git clone https://github.com/RobinGasi/omp-kiro.git
-omp plugin uninstall omp-kiro   # only if a copy is already installed — link cannot replace it
-omp plugin link ./omp-kiro
+git clone https://github.com/RobinGasi/kiro-proxy.git
+omp plugin uninstall omp-kiro   # only if a copy is installed from git/npm — link cannot replace it
+omp plugin link ./kiro-proxy/omp-kiro
 ```
 
 Restart omp — extension modules are wired at session start, so `/reload-plugins` is not enough.
@@ -48,8 +49,10 @@ modelRoles:
 
 Registered via `pi.registerProvider("kiro", …)` on the `openai-completions` wire API. The model list is fetched live
 from the proxy's `/v1/models` through `fetchDynamicModels`, which rides omp's own SQLite model cache (24 h TTL), so
-the catalog tracks whatever the proxy currently serves instead of a hardcoded list. A small seed list covers the case
-where the proxy is down *and* the cache is cold.
+the catalog tracks whatever the proxy currently serves instead of a hardcoded list. When the proxy is down, errors, or
+lists nothing, the fetch fails rather than substituting a stand-in list: omp keeps a returned list for 24 h but retries
+a failed fetch within minutes, so the kiro models appear shortly after the proxy comes up. To refetch right away (e.g.
+after Kiro adds a model), run `omp models refresh`.
 
 **Token limits come from Kiro.** The proxy reads each model's `tokenLimits` from Kiro's own `ListAvailableModels` and
 relays them on `/v1/models` as `context_window` and `max_output_tokens` — a private extension to the OpenAI shape,
@@ -57,7 +60,7 @@ omitted when no limit could be established. So GPT-5.6 Sol advertises the
 [272K window Kiro documents](https://kiro.dev/changelog/models/gpt-5-6/) with a 128K output ceiling, and a model
 Kiro re-tiers is picked up on the next refresh without a plugin change.
 
-When a field is absent — cold cache with the proxy down, or a limit the proxy could not establish — `buildModel`
+When a field is absent — a limit the proxy could not establish — `buildModel`
 falls back to a table of the limits verified against Kiro's catalog, then to a conservative default (200k context,
 8,192 output) for an id it has never seen. The `auto-kiro` router stays on that conservative default on purpose: its
 backing model, and therefore its window, cannot be known ahead of time.

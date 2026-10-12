@@ -16,23 +16,6 @@ export const API_KEY_ENV = "KIRO_PROXY_API_KEY";
 /** Provider name registered with omp; also the `provider` field on kiro models. */
 export const PROVIDER = "kiro";
 
-/**
- * Fallback catalog, used only when the proxy is unreachable *and* omp has no
- * cached model list yet. Keeping it small and current beats an empty provider.
- *
- * Ids only: token limits are left absent so {@link buildModel} resolves them
- * through {@link fallbackLimits} rather than duplicating them here.
- */
-const SEED_MODELS: KiroModel[] = [
-	"auto-kiro",
-	"claude-opus-5",
-	"claude-sonnet-5",
-	"claude-opus-4.8",
-	"claude-sonnet-4.6",
-	"claude-haiku-4.5",
-	"gpt-5.6-sol",
-].map((id) => ({ id }));
-
 /** Read a value from the process env, falling back to `<agentDir>/.env` (`~/.omp/agent/.env`). */
 function readAgentEnvValue(name: string, agentDir: string): string | undefined {
 	if (process.env[name]) return process.env[name];
@@ -110,10 +93,10 @@ export function resolveProxy(agentDir: string): ProxyTarget {
 }
 
 /**
- * Token limits Kiro serves, used only when the proxy is unreachable *and* omp has
- * no cached catalog yet. The proxy reports these live from Kiro's own
+ * Token limits Kiro serves, used only for a model whose limits the proxy could
+ * not establish. The proxy reports these live from Kiro's own
  * `ListAvailableModels` (`context_window` / `max_output_tokens` on `/v1/models`),
- * so this table is a cold-start floor rather than a source of truth.
+ * so this table is a floor rather than a source of truth.
  *
  * Verified against Kiro's catalog on 2026-08-18. The GPT-5.6 tiers match Kiro's
  * published 272K context window (https://kiro.dev/changelog/models/gpt-5-6/).
@@ -233,30 +216,32 @@ export function buildModel(entry: KiroModel): ProviderModelConfig {
 	};
 }
 
-/** Live catalog from the proxy; falls back to the seed when it is unreachable. */
+/**
+ * Live catalog from the proxy. Throws when the proxy is unreachable, errors, or
+ * lists nothing: omp caches a *returned* list as the authoritative catalog for
+ * 24 h, but retries a *failed* fetch after 5 minutes, so a stand-in list here
+ * would pin a stale catalog for a day.
+ */
 export async function fetchModels(baseUrl: string, apiKey: string | undefined): Promise<KiroModel[]> {
-	try {
-		const response = await fetch(`${baseUrl}/models`, {
-			headers: apiKey ? { authorization: `Bearer ${apiKey}` } : undefined,
-			signal: AbortSignal.timeout(5_000),
-		});
-		if (!response.ok) throw new Error(`GET /v1/models -> ${response.status}`);
-		const payload = (await response.json()) as {
-			data?: { id?: string; context_window?: unknown; max_output_tokens?: unknown }[];
-		};
-		const models = (payload.data ?? [])
-			.filter((entry): entry is { id: string; context_window?: unknown; max_output_tokens?: unknown } =>
-				Boolean(entry?.id),
-			)
-			.map((entry) => ({
-				id: entry.id,
-				contextWindow: tokenLimit(entry.context_window),
-				maxOutputTokens: tokenLimit(entry.max_output_tokens),
-			}));
-		return models.length ? models : SEED_MODELS;
-	} catch {
-		return SEED_MODELS;
-	}
+	const response = await fetch(`${baseUrl}/models`, {
+		headers: apiKey ? { authorization: `Bearer ${apiKey}` } : undefined,
+		signal: AbortSignal.timeout(5_000),
+	});
+	if (!response.ok) throw new Error(`GET /v1/models -> ${response.status}`);
+	const payload = (await response.json()) as {
+		data?: { id?: string; context_window?: unknown; max_output_tokens?: unknown }[];
+	};
+	const models = (payload.data ?? [])
+		.filter((entry): entry is { id: string; context_window?: unknown; max_output_tokens?: unknown } =>
+			Boolean(entry?.id),
+		)
+		.map((entry) => ({
+			id: entry.id,
+			contextWindow: tokenLimit(entry.context_window),
+			maxOutputTokens: tokenLimit(entry.max_output_tokens),
+		}));
+	if (!models.length) throw new Error("GET /v1/models returned no models");
+	return models;
 }
 
 /** Credit balance the proxy reports for the account it is currently serving. */
@@ -269,8 +254,8 @@ export interface KiroCredits {
 /**
  * Live credit balance from the proxy's `GET /v1/usage`.
  *
- * Unlike {@link fetchModelIds} this throws instead of degrading: the status line
- * swallows the failure, but `/kiro-credits` reports the reason.
+ * Throws on failure like {@link fetchModels}: the status line swallows the
+ * failure, but `/kiro-credits` reports the reason.
  */
 export async function fetchCredits(baseUrl: string, apiKey: string | undefined): Promise<KiroCredits> {
 	const response = await fetch(`${baseUrl}/usage`, {
