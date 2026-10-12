@@ -49,6 +49,7 @@ const (
 	EventToolUse      = "tool_use"
 	EventUsage        = "usage"
 	EventContextUsage = "context_usage"
+	EventMetadata     = "metadata"
 )
 
 // readBufferSize is the chunk size used for bounded reads of the response body.
@@ -59,8 +60,7 @@ const readBufferSize = 64 * 1024
 //
 // Only the fields relevant to Type are populated:
 //
-//   - EventContent:      Content
-//   - EventThinking:     ThinkingContent, IsFirstThinkingChunk, IsLastThinkingChunk
+//   - EventThinking:     ThinkingContent plus opaque signature/redaction metadata
 //   - EventToolUse:      ToolUse (OpenAI-shaped map) and ToolCall (typed)
 //   - EventUsage:        Usage
 //   - EventContextUsage: ContextUsagePercentage
@@ -71,17 +71,29 @@ type KiroEvent struct {
 	Content string
 	// ThinkingContent is the reasoning text fragment (EventThinking).
 	ThinkingContent string
+	// ThinkingSignature is opaque provider metadata for replay. It is never
+	// interpreted or promoted to ordinary assistant text.
+	ThinkingSignature string
+	// RedactedThinkingData is opaque encrypted reasoning returned when the
+	// provider redacts a thinking block.
+	RedactedThinkingData string
+	// NativeThinking distinguishes Kiro reasoningContentEvent data from the
+	// legacy XML-tag emulation path.
+	NativeThinking bool
 	// ToolUse is the reconstructed tool call in OpenAI map shape
 	// ({"id","type","function":{"name","arguments"}}), for EventToolUse.
 	ToolUse map[string]any
 	// ToolCall is the typed form of the same tool call, carried alongside ToolUse
 	// so collectors can accumulate awsstream.ToolCall values without re-parsing.
 	ToolCall *awsstream.ToolCall
-	// Usage is the metering payload for EventUsage.
+	// Usage is the metering/token payload for EventUsage.
 	Usage map[string]any
 	// ContextUsagePercentage is the Kiro context-usage percentage for
 	// EventContextUsage.
 	ContextUsagePercentage float64
+	// StopReason and StopDetails carry Kiro's terminal metadata verdict.
+	StopReason  string
+	StopDetails map[string]any
 	// IsFirstThinkingChunk reports whether ThinkingContent is the first delta of
 	// the thinking block.
 	IsFirstThinkingChunk bool
@@ -95,15 +107,19 @@ type StreamResult struct {
 	Content string
 	// ThinkingContent is the full reasoning text.
 	ThinkingContent string
-	// ToolCalls is the deduplicated set of tool calls (native + bracket-style).
+	// ThinkingSignature and RedactedThinkingData preserve opaque native Kiro
+	// reasoning metadata for Anthropic-compatible clients and history replay.
+	ThinkingSignature    string
+	RedactedThinkingData string
+	// ToolCalls is the deduplicated set of tool calls (native + text-encoded).
 	ToolCalls []awsstream.ToolCall
 	// Usage is the last usage payload seen, if any.
 	Usage map[string]any
 	// ContextUsagePercentage is the context-usage percentage reported by Kiro.
 	ContextUsagePercentage float64
-	// StopReason is left empty by the core layer; API formatters set the value
-	// appropriate to their wire format.
-	StopReason string
+	// StopReason and StopDetails preserve Kiro's terminal metadata.
+	StopReason  string
+	StopDetails map[string]any
 }
 
 // CorrectedTokens derives prompt/total/completion token counts from the Kiro
@@ -154,12 +170,16 @@ func (e *UpstreamStatusError) Error() string {
 }
 
 // UpstreamStreamError reports an HTTP 200 response that ended with an embedded
-// upstream exception or without any recognized Kiro event. Kiro can encode
-// model/capacity failures in the event stream instead of the HTTP status.
+// upstream exception or without any client-visible output (content, thinking or
+// a tool call). Kiro can encode model/capacity failures in the event stream
+// instead of the HTTP status, and can end a stream with only usage metadata.
 type UpstreamStreamError struct {
-	Message string
-	Reason  string
-	// BeforeFirstEvent is true when no recognized event was emitted, making the
+	Message      string
+	Reason       string
+	FailureClass string
+	StopReason   string
+	StopDetails  map[string]any
+	// BeforeFirstEvent is true when no answer event was emitted, making the
 	// request safe to retry without duplicating client-visible output.
 	BeforeFirstEvent  bool
 	BytesRead         int64
@@ -183,7 +203,13 @@ func (e *UpstreamStreamError) Error() string {
 	if e.Reason != "" {
 		return e.Reason
 	}
-	return "upstream stream ended without any recognized events"
+	switch e.FailureClass {
+	case "reasoning_only":
+		return "Kiro produced reasoning but no final answer"
+	case "metadata_only":
+		return "Kiro completed without a final answer"
+	}
+	return "Kiro stream ended without assistant output"
 }
 
 // IsEmptyResponse reports the zero-byte HTTP 200 response Kiro emits when it
@@ -201,6 +227,9 @@ type StreamOptions struct {
 	// stream. It is ANDed with cfg.FakeReasoningEnabled. Callers disable it for
 	// models that ignore the injected reasoning tags (bug #178).
 	EnableThinkingParser bool
+	// AdvertisedTools enables validated text-emitted tool recovery. Names are the
+	// exact names sent to Kiro.
+	AdvertisedTools []string
 }
 
 // StreamWithFirstTokenRetry starts an upstream request via start and returns a
@@ -240,6 +269,7 @@ func StreamWithFirstTokenRetryOpts(ctx context.Context, cfg *config.Config, star
 	if maxRetries < 1 {
 		maxRetries = DefaultFirstTokenMaxRetries
 	}
+	ctx = util.WithAttemptBudget(ctx, maxRetries)
 
 	go func() {
 		defer close(events)
@@ -287,15 +317,16 @@ func StreamWithFirstTokenRetryOpts(ctx context.Context, cfg *config.Config, star
 			var fte *FirstTokenTimeoutError
 			var use *UpstreamStreamError
 			isFirstTokenTimeout := errors.As(err, &fte)
-			isBeforeFirstEvent := errors.As(err, &use) && use.BeforeFirstEvent
-			if isBeforeFirstEvent && use.BytesRead == 0 {
-				slog.WarnContext(ctx, "streaming: empty upstream response will not be retried",
+			isBeforeAnswer := errors.As(err, &use) && use.BeforeFirstEvent
+			if isBeforeAnswer && nonRetryableStreamFailure(use.FailureClass) {
+				slog.WarnContext(ctx, "streaming: non-retryable upstream stream failure",
 					"req_id", util.RequestID(ctx), "attempt", attempt+1,
+					"failure_class", use.FailureClass, "stop_reason", use.StopReason,
 					"upstream_request_id", use.UpstreamRequestID)
 				errc <- err
 				return
 			}
-			if isFirstTokenTimeout || isBeforeFirstEvent {
+			if (isFirstTokenTimeout || isBeforeAnswer) && util.AttemptsRemaining(ctx) {
 				lastErr = err
 				attrs := []any{
 					"req_id", util.RequestID(ctx), "attempt", attempt + 1, "max", maxRetries,
@@ -303,19 +334,34 @@ func StreamWithFirstTokenRetryOpts(ctx context.Context, cfg *config.Config, star
 				}
 				if use != nil {
 					attrs = append(attrs,
-						"termination", use.Termination, "bytes_read", use.BytesRead,
-						"chunks_read", use.ChunksRead, "recognized_events", use.RecognizedEvents,
+						"failure_class", use.FailureClass, "termination", use.Termination,
+						"bytes_read", use.BytesRead, "chunks_read", use.ChunksRead,
+						"recognized_events", use.RecognizedEvents,
 						"unmatched_bytes", use.UnmatchedBytes, "reason", use.Reason,
-						"has_upstream_message", use.Message != "", "duration_ms", use.Duration.Milliseconds(),
+						"stop_reason", use.StopReason, "has_upstream_message", use.Message != "",
+						"duration_ms", use.Duration.Milliseconds(),
 						"content_type", use.ContentType, "content_length", use.ContentLength,
 						"upstream_request_id", use.UpstreamRequestID)
 				}
-				slog.WarnContext(ctx, "streaming: attempt ended before first event", attrs...)
-				continue
+				slog.WarnContext(ctx, "streaming: attempt ended before final answer", attrs...)
+				if attempt+1 < maxRetries && util.AttemptsRemaining(ctx) {
+					delay := time.Second << attempt
+					timer := time.NewTimer(delay)
+					select {
+					case <-ctx.Done():
+						timer.Stop()
+						errc <- ctx.Err()
+						return
+					case <-timer.C:
+					}
+					continue
+				}
+				errc <- err
+				return
 			}
 
-			// Any other error is terminal; parseKiroStream already logged its safe
-			// termination metrics at the point where the cause was known.
+			// Any error after answer output is terminal: replay would duplicate text
+			// or tool side effects.
 			errc <- err
 			return
 		}
@@ -337,17 +383,51 @@ func StreamWithFirstTokenRetryOpts(ctx context.Context, cfg *config.Config, star
 }
 
 type streamAttemptStats struct {
-	started       time.Time
-	bytesRead     int64
-	chunksRead    int
-	contentEvents int
-	usageEvents   int
-	contextEvents int
-	toolEvents    int
+	started         time.Time
+	bytesRead       int64
+	chunksRead      int
+	contentEvents   int
+	reasoningEvents int
+	usageEvents     int
+	contextEvents   int
+	toolEvents      int
+	answerEvents    int
+	pendingEvents   []KiroEvent
+	stopReason      string
+	stopDetails     map[string]any
+	errorMessage    string
+	errorReason     string
+	eventTypes      eventTypeCounter
+	textTools       *taggedToolBuffer
 }
 
 func (s *streamAttemptStats) recognizedEvents() int {
-	return s.contentEvents + s.usageEvents + s.contextEvents + s.toolEvents
+	return s.contentEvents + s.reasoningEvents + s.usageEvents + s.contextEvents + s.toolEvents
+}
+
+// emitDeferred preserves wire order while keeping an answerless attempt private
+// from the client. Once text or a tool call commits the turn, buffered reasoning
+// and metadata are released before the answer event that followed them.
+func (s *streamAttemptStats) emitDeferred(ctx context.Context, out chan<- KiroEvent, ev KiroEvent, answer bool) error {
+	if !answer && s.answerEvents == 0 {
+		s.pendingEvents = append(s.pendingEvents, ev)
+		return nil
+	}
+	if answer && s.answerEvents == 0 {
+		for _, pending := range s.pendingEvents {
+			if err := send(ctx, out, pending); err != nil {
+				return err
+			}
+		}
+		s.pendingEvents = nil
+	}
+	if err := send(ctx, out, ev); err != nil {
+		return err
+	}
+	if answer {
+		s.answerEvents++
+	}
+	return nil
 }
 
 func streamLogAttrs(ctx context.Context, resp *http.Response, stats *streamAttemptStats, parser *awsstream.Parser, termination string) []any {
@@ -355,27 +435,54 @@ func streamLogAttrs(ctx context.Context, resp *http.Response, stats *streamAttem
 		"req_id", util.RequestID(ctx), "termination", termination,
 		"duration_ms", time.Since(stats.started).Milliseconds(),
 		"bytes_read", stats.bytesRead, "chunks_read", stats.chunksRead,
-		"recognized_events", stats.recognizedEvents(),
-		"content_events", stats.contentEvents, "usage_events", stats.usageEvents,
-		"context_events", stats.contextEvents, "tool_events", stats.toolEvents,
-		"unmatched_bytes", len(parser.BufferedText()),
+		"recognized_events", stats.recognizedEvents(), "answer_events", stats.answerEvents,
+		"content_events", stats.contentEvents, "reasoning_events", stats.reasoningEvents,
+		"usage_events", stats.usageEvents, "context_events", stats.contextEvents,
+		"tool_events", stats.toolEvents, "unmatched_bytes", len(parser.BufferedText()),
+		"event_types", stats.eventTypes.String(), "stop_reason", stats.stopReason,
 		"status", resp.StatusCode, "content_type", resp.Header.Get("Content-Type"),
 		"content_length", resp.ContentLength,
 		"upstream_request_id", util.UpstreamRequestID(resp.Header),
 	}
 }
 
-func streamFailureClass(stats *streamAttemptStats, parser *awsstream.Parser, message, reason string) string {
-	if message != "" || reason != "" {
+func streamFailureClass(stats *streamAttemptStats, parser *awsstream.Parser) string {
+	stop := strings.ToUpper(strings.TrimSpace(stats.stopReason))
+	if stop == "REFUSAL" || stop == "CONTENT_FILTERED" || stop == "GUARDRAIL_INTERVENED" {
+		return "content_filter"
+	}
+	reason := strings.ToUpper(stats.errorReason)
+	if strings.Contains(reason, "THROTTL") || strings.Contains(reason, "SERVICE_UNAVAILABLE") ||
+		strings.Contains(reason, "INTERNAL_SERVER") || strings.Contains(reason, "CAPACITY") ||
+		strings.Contains(reason, "TRANSPORT") {
+		return "transient_upstream"
+	}
+	if stats.errorReason == "TRUNCATED_EVENT_STREAM" {
+		return "truncated_stream"
+	}
+	if stats.errorMessage != "" || stats.errorReason != "" {
 		return "upstream_exception"
+	}
+	if stop == "MAX_TOKENS" {
+		return "max_tokens"
 	}
 	if stats.bytesRead == 0 {
 		return "empty_response"
 	}
+	if stats.reasoningEvents > 0 && stats.answerEvents == 0 {
+		return "reasoning_only"
+	}
 	if stats.recognizedEvents() == 0 && len(parser.BufferedText()) > 0 {
 		return "unrecognized_stream"
 	}
+	if stats.answerEvents == 0 {
+		return "metadata_only"
+	}
 	return "terminal_exception"
+}
+
+func nonRetryableStreamFailure(class string) bool {
+	return class == "content_filter" || class == "upstream_exception"
 }
 
 // parseKiroStream reads resp.Body in bounded chunks, drives the awsstream and
@@ -391,7 +498,7 @@ func parseKiroStream(ctx context.Context, cfg *config.Config, resp *http.Respons
 
 	parser := awsstream.NewParser()
 	parser.TruncationRecovery = cfg.TruncationRecovery
-	stats := &streamAttemptStats{started: time.Now()}
+	stats := &streamAttemptStats{started: time.Now(), textTools: newTaggedToolBuffer(opts.AdvertisedTools)}
 
 	var tp *thinking.Parser
 	if opts.EnableThinkingParser {
@@ -438,21 +545,23 @@ func parseKiroStream(ctx context.Context, cfg *config.Config, resp *http.Respons
 
 	firstReceived := false
 	finish := func(termination string) error {
-		toolEvents, err := finalizeStream(ctx, parser, tp, out)
-		if err != nil {
+		if err := parser.FlushStream(); err != nil {
+			stats.errorReason = "TRUNCATED_EVENT_STREAM"
+			stats.errorMessage = err.Error()
+		}
+		if err := finalizeStream(ctx, parser, tp, out, stats); err != nil {
 			return err
 		}
-		stats.toolEvents += toolEvents
-		message, reason := extractStreamError(parser.BufferedText())
-		if message != "" || reason != "" || stats.recognizedEvents() == 0 {
-			failureClass := streamFailureClass(stats, parser, message, reason)
+		failureClass := streamFailureClass(stats, parser)
+		if stats.answerEvents == 0 || stats.errorMessage != "" || stats.errorReason != "" {
 			attrs := streamLogAttrs(ctx, resp, stats, parser, termination)
 			attrs = append(attrs, "failure_class", failureClass,
-				"reason", reason, "has_upstream_message", message != "")
+				"reason", stats.errorReason, "has_upstream_message", stats.errorMessage != "")
 			slog.WarnContext(ctx, "streaming: upstream stream ended unsuccessfully", attrs...)
 			return &UpstreamStreamError{
-				Message: message, Reason: reason,
-				BeforeFirstEvent: stats.recognizedEvents() == 0,
+				Message: stats.errorMessage, Reason: stats.errorReason,
+				FailureClass: failureClass, StopReason: stats.stopReason, StopDetails: stats.stopDetails,
+				BeforeFirstEvent: stats.answerEvents == 0,
 				BytesRead:        stats.bytesRead, ChunksRead: stats.chunksRead,
 				RecognizedEvents: stats.recognizedEvents(), UnmatchedBytes: len(parser.BufferedText()),
 				Termination: termination, Duration: time.Since(stats.started),
@@ -502,14 +611,19 @@ func parseKiroStream(ctx context.Context, cfg *config.Config, resp *http.Respons
 				slog.WarnContext(ctx, "streaming: upstream body read failed",
 					append(streamLogAttrs(ctx, resp, stats, parser, "read_error"),
 						"error_type", fmt.Sprintf("%T", rc.err), "err", rc.err)...)
-				return rc.err
+				stats.errorReason = "UPSTREAM_TRANSPORT_ERROR"
+				stats.errorMessage = rc.err.Error()
+				return finish("read_error")
 			}
 			firstReceived = true
 			stats.bytesRead += int64(len(rc.data))
 			stats.chunksRead++
+			stats.eventTypes.feed(rc.data)
 			dbg.LogRawChunk(rc.data)
 			if err := processChunk(ctx, parser, tp, rc.data, out, stats); err != nil {
-				return err
+				stats.errorReason = "EVENT_STREAM_PROTOCOL_ERROR"
+				stats.errorMessage = err.Error()
+				return finish("parse_error")
 			}
 		}
 	}
@@ -518,87 +632,157 @@ func parseKiroStream(ctx context.Context, cfg *config.Config, resp *http.Respons
 // processChunk feeds a raw chunk to the awsstream parser and emits the resulting
 // unified events, routing content through the thinking parser when enabled.
 func processChunk(ctx context.Context, parser *awsstream.Parser, tp *thinking.Parser, chunk []byte, out chan<- KiroEvent, stats *streamAttemptStats) error {
-	for _, ev := range parser.Feed(chunk) {
+	events, err := parser.FeedStream(chunk)
+	if err != nil {
+		return err
+	}
+	for _, ev := range events {
 		switch ev.Type {
 		case awsstream.EventContent:
-			stats.contentEvents++
 			content, _ := ev.Data.(string)
-			if tp != nil {
-				res := tp.Feed(content)
-				if res.ThinkingContent != "" {
-					if processed, ok := tp.ProcessForOutput(res.ThinkingContent, res.IsFirstThinkingChunk, res.IsLastThinkingChunk); ok && processed != "" {
-						if err := send(ctx, out, KiroEvent{
-							Type:                 EventThinking,
-							ThinkingContent:      processed,
-							IsFirstThinkingChunk: res.IsFirstThinkingChunk,
-							IsLastThinkingChunk:  res.IsLastThinkingChunk,
-						}); err != nil {
-							return err
-						}
-					}
-				}
-				if res.RegularContent != "" {
-					if err := send(ctx, out, KiroEvent{Type: EventContent, Content: res.RegularContent}); err != nil {
+			if content == "" {
+				continue
+			}
+			stats.contentEvents++
+			if tp == nil {
+				content = stats.textTools.Feed(content)
+				if content != "" {
+					if err := stats.emitDeferred(ctx, out, KiroEvent{Type: EventContent, Content: content}, true); err != nil {
 						return err
 					}
 				}
-			} else if err := send(ctx, out, KiroEvent{Type: EventContent, Content: content}); err != nil {
-				return err
+				continue
+			}
+			res := tp.Feed(content)
+			if res.ThinkingContent != "" {
+				if processed, ok := tp.ProcessForOutput(res.ThinkingContent, res.IsFirstThinkingChunk, res.IsLastThinkingChunk); ok && processed != "" {
+					stats.reasoningEvents++
+					if err := stats.emitDeferred(ctx, out, KiroEvent{Type: EventThinking, ThinkingContent: processed,
+						IsFirstThinkingChunk: res.IsFirstThinkingChunk, IsLastThinkingChunk: res.IsLastThinkingChunk}, false); err != nil {
+						return err
+					}
+				}
+			}
+			if res.RegularContent != "" {
+				regular := stats.textTools.Feed(res.RegularContent)
+				if regular != "" {
+					if err := stats.emitDeferred(ctx, out, KiroEvent{Type: EventContent, Content: regular}, true); err != nil {
+						return err
+					}
+				}
+			}
+
+		case awsstream.EventReasoning:
+			data, _ := ev.Data.(map[string]any)
+			text, _ := data["text"].(string)
+			signature, _ := data["signature"].(string)
+			redacted, _ := data["redactedContent"].(string)
+			if text != "" || signature != "" || redacted != "" {
+				stats.reasoningEvents++
+				if err := stats.emitDeferred(ctx, out, KiroEvent{
+					Type: EventThinking, ThinkingContent: text,
+					ThinkingSignature: signature, RedactedThinkingData: redacted,
+					NativeThinking: true,
+				}, false); err != nil {
+					return err
+				}
 			}
 
 		case awsstream.EventUsage:
 			stats.usageEvents++
-			if err := send(ctx, out, KiroEvent{Type: EventUsage, Usage: usageToMap(ev.Data)}); err != nil {
+			if err := stats.emitDeferred(ctx, out, KiroEvent{Type: EventUsage, Usage: usageToMap(ev.Data)}, false); err != nil {
 				return err
 			}
 
 		case awsstream.EventContextUsage:
 			stats.contextEvents++
-			if err := send(ctx, out, KiroEvent{Type: EventContextUsage, ContextUsagePercentage: toFloat(ev.Data)}); err != nil {
+			if err := stats.emitDeferred(ctx, out, KiroEvent{Type: EventContextUsage, ContextUsagePercentage: toFloat(ev.Data)}, false); err != nil {
 				return err
+			}
+
+		case awsstream.EventMetadata:
+			data, _ := ev.Data.(map[string]any)
+			stats.stopReason = firstString(data, "stopReason")
+			if details, ok := data["stopDetails"].(map[string]any); ok {
+				stats.stopDetails = details
+			}
+			if tokenUsage, ok := data["tokenUsage"].(map[string]any); ok {
+				stats.usageEvents++
+				if err := stats.emitDeferred(ctx, out, KiroEvent{Type: EventUsage, Usage: tokenUsage}, false); err != nil {
+					return err
+				}
+			}
+			if stats.stopReason != "" || stats.stopDetails != nil {
+				if err := stats.emitDeferred(ctx, out, KiroEvent{Type: EventMetadata,
+					StopReason: stats.stopReason, StopDetails: stats.stopDetails}, false); err != nil {
+					return err
+				}
+			}
+
+		case awsstream.EventError:
+			data, _ := ev.Data.(map[string]any)
+			stats.errorMessage = firstString(data, "message", "Message", "originalMessage")
+			stats.errorReason = firstString(data, "reason", "code", "errorCode", "__type")
+			if stats.errorReason == "" {
+				stats.errorReason = ev.UpstreamType
 			}
 		}
 	}
 	return nil
 }
 
-// finalizeStream flushes any trailing thinking content and emits the
-// reconstructed tool calls once the stream has ended. The returned count covers
-// tool calls recognized without producing an Event from Parser.Feed.
-func finalizeStream(ctx context.Context, parser *awsstream.Parser, tp *thinking.Parser, out chan<- KiroEvent) (int, error) {
+// finalizeStream flushes trailing tag-based reasoning and reconstructs tool calls.
+func finalizeStream(ctx context.Context, parser *awsstream.Parser, tp *thinking.Parser, out chan<- KiroEvent, stats *streamAttemptStats) error {
 	if tp != nil {
 		fin := tp.Finalize()
 		if fin.ThinkingContent != "" {
 			if processed, ok := tp.ProcessForOutput(fin.ThinkingContent, fin.IsFirstThinkingChunk, fin.IsLastThinkingChunk); ok && processed != "" {
-				if err := send(ctx, out, KiroEvent{
-					Type:                 EventThinking,
-					ThinkingContent:      processed,
-					IsFirstThinkingChunk: fin.IsFirstThinkingChunk,
-					IsLastThinkingChunk:  fin.IsLastThinkingChunk,
-				}); err != nil {
-					return 0, err
+				stats.reasoningEvents++
+				if err := stats.emitDeferred(ctx, out, KiroEvent{Type: EventThinking, ThinkingContent: processed,
+					IsFirstThinkingChunk: fin.IsFirstThinkingChunk, IsLastThinkingChunk: fin.IsLastThinkingChunk}, false); err != nil {
+					return err
 				}
 			}
 		}
 		if fin.RegularContent != "" {
-			if err := send(ctx, out, KiroEvent{Type: EventContent, Content: fin.RegularContent}); err != nil {
-				return 0, err
+			stats.contentEvents++
+			regular := stats.textTools.Feed(fin.RegularContent)
+			if regular != "" {
+				if err := stats.emitDeferred(ctx, out, KiroEvent{Type: EventContent, Content: regular}, true); err != nil {
+					return err
+				}
 			}
 		}
 	}
 
-	toolCalls := parser.GetToolCalls()
-	for _, tc := range toolCalls {
-		tc := tc
-		if err := send(ctx, out, KiroEvent{
-			Type:     EventToolUse,
-			ToolUse:  toolCallToMap(tc),
-			ToolCall: &tc,
-		}); err != nil {
-			return len(toolCalls), err
+	if stats.textTools != nil {
+		cleaned, recovered := stats.textTools.Finalize()
+		if cleaned != "" {
+			stats.contentEvents++
+			if err := stats.emitDeferred(ctx, out, KiroEvent{Type: EventContent, Content: cleaned}, true); err != nil {
+				return err
+			}
+		}
+		if len(parser.GetToolCalls()) == 0 {
+			for _, tc := range recovered {
+				tc := tc
+				stats.toolEvents++
+				if err := stats.emitDeferred(ctx, out, KiroEvent{Type: EventToolUse, ToolUse: toolCallToMap(tc), ToolCall: &tc}, true); err != nil {
+					return err
+				}
+			}
 		}
 	}
-	return len(toolCalls), nil
+
+	for _, tc := range parser.GetToolCalls() {
+		tc := tc
+		stats.toolEvents++
+		if err := stats.emitDeferred(ctx, out, KiroEvent{Type: EventToolUse,
+			ToolUse: toolCallToMap(tc), ToolCall: &tc}, true); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // extractStreamError recovers the useful fields from an exception JSON object
@@ -655,6 +839,12 @@ func CollectStreamResult(events <-chan KiroEvent, errc <-chan error) (*StreamRes
 			full.WriteString(ev.Content)
 		case EventThinking:
 			result.ThinkingContent += ev.ThinkingContent
+			if ev.ThinkingSignature != "" {
+				result.ThinkingSignature = ev.ThinkingSignature
+			}
+			if ev.RedactedThinkingData != "" {
+				result.RedactedThinkingData = ev.RedactedThinkingData
+			}
 			full.WriteString(ev.ThinkingContent)
 		case EventToolUse:
 			if ev.ToolCall != nil {
@@ -666,6 +856,9 @@ func CollectStreamResult(events <-chan KiroEvent, errc <-chan error) (*StreamRes
 			}
 		case EventContextUsage:
 			result.ContextUsagePercentage = ev.ContextUsagePercentage
+		case EventMetadata:
+			result.StopReason = ev.StopReason
+			result.StopDetails = ev.StopDetails
 		}
 	}
 

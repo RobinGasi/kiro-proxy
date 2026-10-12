@@ -47,8 +47,10 @@ func BuildKiroPayload(ctx context.Context, cfg *config.Config, in Request, profi
 
 	conversationID := util.GenerateConversationID(simplifyMessages(in.Messages))
 
-	// Process tools with long descriptions (move documentation to system prompt).
-	processedTools, toolDocumentation := processToolsWithLongDescriptions(in.Tools, cfg.ToolDescriptionMaxLength)
+	// Apply tool choice before documentation and aliasing so every downstream
+	// representation sees the same selected definitions.
+	selectedTools, toolChoiceInstruction := applyToolChoice(in.Tools, in.ToolChoice)
+	processedTools, toolDocumentation := processToolsWithLongDescriptions(selectedTools, cfg.ToolDescriptionMaxLength)
 
 	// Rewrite tool names that exceed Kiro's 64-character limit to a deterministic
 	// ≤64-char alias (see ShortenToolName). toolNameReverse maps each alias back to
@@ -56,16 +58,24 @@ func BuildKiroPayload(ctx context.Context, cfg *config.Config, in Request, profi
 	// in the model's tool_use blocks, so the aliasing is invisible to clients.
 	processedTools, toolNameReverse := aliasTools(processedTools)
 
-	// Assemble the full system prompt: base + tool docs + thinking + truncation.
+	// Prefer native reasoning and copy generation controls only when Kiro's live
+	// schema advertises them. XML remains a reasoning-only fallback.
+	nativeReasoning := buildNativeReasoningFields(in.ModelRequestSchema, in.Thinking)
+	modelRequestFields := mergeRequestFields(nativeReasoning, buildGenerationFields(in.ModelRequestSchema, in.Generation))
+	emulatedThinking := in.Thinking
+	if nativeReasoning != nil {
+		emulatedThinking.Enabled = false
+	}
 	fullSystem := in.System
 	fullSystem = appendSystemAddition(fullSystem, toolDocumentation)
-	fullSystem = appendSystemAddition(fullSystem, getThinkingSystemPromptAddition(cfg))
+	fullSystem = appendSystemAddition(fullSystem, toolChoiceInstruction)
+	fullSystem = appendSystemAddition(fullSystem, getThinkingSystemPromptAddition(cfg, emulatedThinking))
 	fullSystem = appendSystemAddition(fullSystem, getTruncationRecoverySystemAddition(cfg))
 
 	// When no tools are defined, strip all tool content (Kiro rejects toolResults
 	// without tools); otherwise repair orphaned tool results.
 	var messages []Message
-	if len(in.Tools) == 0 {
+	if len(processedTools) == 0 {
 		messages, _ = stripAllToolContent(in.Messages)
 	} else {
 		messages, _ = ensureAssistantBeforeToolResults(in.Messages)
@@ -139,9 +149,9 @@ func BuildKiroPayload(ctx context.Context, cfg *config.Config, in Request, profi
 		userInputContext["toolResults"] = tr
 	}
 
-	// Inject thinking tags only into the current user message.
+	// Inject XML thinking tags only for legacy models without native fields.
 	if current.Role == "user" {
-		currentContent = injectThinkingTags(currentContent, cfg, in.Thinking)
+		currentContent = injectThinkingTags(currentContent, cfg, emulatedThinking)
 	}
 
 	userInputMessage := map[string]any{
@@ -169,6 +179,9 @@ func BuildKiroPayload(ctx context.Context, cfg *config.Config, in Request, profi
 
 	payload := map[string]any{
 		"conversationState": conversationState,
+	}
+	if modelRequestFields != nil {
+		payload["additionalModelRequestFields"] = modelRequestFields
 	}
 	if profileARN != "" {
 		payload["profileArn"] = profileARN

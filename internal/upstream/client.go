@@ -150,12 +150,10 @@ func (c *Client) ListAvailableModels(ctx context.Context, am AuthProvider) ([]mo
 		Models []struct {
 			ModelID     string `json:"modelId"`
 			TokenLimits struct {
-				// Kiro sends plain integers, but they are decoded as JSON numbers
-				// so an exponent form (1.0e6) or a float cannot fail the whole
-				// catalog.
 				MaxInputTokens  json.Number `json:"maxInputTokens"`
 				MaxOutputTokens json.Number `json:"maxOutputTokens"`
 			} `json:"tokenLimits"`
+			AdditionalModelRequestFieldsSchema json.RawMessage `json:"additionalModelRequestFieldsSchema"`
 		} `json:"models"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
@@ -172,6 +170,7 @@ func (c *Client) ListAvailableModels(ctx context.Context, am AuthProvider) ([]mo
 				MaxInputTokens:  tokenCount(m.TokenLimits.MaxInputTokens),
 				MaxOutputTokens: tokenCount(m.TokenLimits.MaxOutputTokens),
 			},
+			AdditionalModelRequestFieldsSchema: append(json.RawMessage(nil), m.AdditionalModelRequestFieldsSchema...),
 		})
 	}
 	if len(models) == 0 {
@@ -236,6 +235,14 @@ func (c *Client) doWithRetry(ctx context.Context, am AuthProvider, operation str
 			req.Close = true
 		}
 
+		requestAttempt, requestMax, allowed := util.ConsumeAttempt(ctx)
+		if !allowed {
+			lastErr = util.ErrAttemptBudgetExhausted
+			break
+		}
+		if requestMax > 0 {
+			req.Header.Set("amz-sdk-request", fmt.Sprintf("attempt=%d; max=%d", requestAttempt, requestMax))
+		}
 		requestStarted := time.Now()
 		resp, err := c.hc.Do(req)
 		duration := time.Since(requestStarted)
@@ -270,6 +277,7 @@ func (c *Client) doWithRetry(ctx context.Context, am AuthProvider, operation str
 		responseAttrs := []any{
 			"req_id", util.RequestID(ctx), "operation", operation, "stream", stream,
 			"attempt", attempt + 1, "max", maxRetries,
+			"request_attempt", requestAttempt, "request_max", requestMax,
 			"status", resp.StatusCode, "duration_ms", duration.Milliseconds(),
 			"content_type", resp.Header.Get("Content-Type"),
 			"content_length", resp.ContentLength,

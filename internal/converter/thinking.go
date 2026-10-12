@@ -22,9 +22,10 @@ const thinkingInstruction = "Think in English for better reasoning quality.\n\n"
 	"Take the time you need. Quality of thought matters more than speed."
 
 // getThinkingSystemPromptAddition returns the system-prompt text that legitimizes
-// the injected thinking tags, or "" when fake reasoning is disabled.
-func getThinkingSystemPromptAddition(cfg *config.Config) string {
-	if !cfg.FakeReasoningEnabled {
+// injected reasoning tags. It is omitted when either global or request-level
+// thinking is disabled, including answerless-turn recovery attempts.
+func getThinkingSystemPromptAddition(cfg *config.Config, tc ThinkingConfig) string {
+	if !cfg.FakeReasoningEnabled || !tc.Enabled {
 		return ""
 	}
 	return "\n\n---\n" +

@@ -2,10 +2,15 @@ package anthropic
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
+	"strings"
 
 	"git.gasi.dev/robin/kiro-proxy/internal/converter"
 )
+
+var errUnsupportedContent = errors.New("unsupported Anthropic content block")
 
 // buildConverterRequest turns a parsed Anthropic *MessagesRequest into the
 // API-agnostic converter.Request consumed by converter.BuildKiroPayload.
@@ -37,8 +42,47 @@ func buildConverterRequest(req *MessagesRequest) converter.Request {
 		Messages:   messages,
 		Tools:      convertTools(req.Tools),
 		ToolChoice: decodeToolChoice(req.ToolChoice),
-		Thinking:   thinkingConfig(req.Thinking),
+		Generation: converter.GenerationConfig{
+			MaxTokens: intPointer(req.MaxTokens), Temperature: req.Temperature,
+			TopP: req.TopP, TopK: req.TopK,
+		},
+		Thinking: thinkingConfig(req),
 	}
+}
+
+func validateContentBlocks(req *MessagesRequest) error {
+	for messageIndex, message := range req.Messages {
+		if message.Content.IsString() {
+			continue
+		}
+		for blockIndex, raw := range message.Content.Blocks() {
+			var block struct {
+				Type   string `json:"type"`
+				Source struct {
+					Type string `json:"type"`
+				} `json:"source"`
+			}
+			if json.Unmarshal(raw, &block) != nil || block.Type == "" {
+				return fmt.Errorf("%w at messages[%d].content[%d]: malformed block", errUnsupportedContent, messageIndex, blockIndex)
+			}
+			switch block.Type {
+			case "text", "tool_use", "tool_result", "thinking", "redacted_thinking", "server_tool_use", "web_search_tool_result", "search_result":
+			case "image":
+				if block.Source.Type == "url" {
+					return fmt.Errorf("%w at messages[%d].content[%d]: URL images are not supported; send a base64 source", errUnsupportedContent, messageIndex, blockIndex)
+				}
+			case "document":
+				return fmt.Errorf("%w at messages[%d].content[%d]: document blocks are not supported by Kiro", errUnsupportedContent, messageIndex, blockIndex)
+			default:
+				return fmt.Errorf("%w at messages[%d].content[%d]: type %q", errUnsupportedContent, messageIndex, blockIndex, block.Type)
+			}
+		}
+	}
+	return nil
+}
+
+func preserveStructuredBlock(raw json.RawMessage, blockType string) converter.ContentPart {
+	return converter.ContentPart{Type: "text", Text: fmt.Sprintf("[Anthropic %s]\n%s", blockType, string(raw))}
 }
 
 // convertTurn maps a single normalized user/assistant message into the unified
@@ -100,6 +144,11 @@ func convertTurn(turn Message) converter.Message {
 				msg.ToolResults = append(msg.ToolResults, tr)
 				images = append(images, trImages...)
 			}
+		case "thinking", "redacted_thinking":
+			// Kiro rejects assistantResponseMessage.reasoningContent. Recognize and
+			// intentionally omit these opaque blocks rather than leaking them as text.
+		case "server_tool_use", "web_search_tool_result", "search_result":
+			msg.Content = append(msg.Content, preserveStructuredBlock(raw, head.Type))
 		}
 	}
 
@@ -227,41 +276,78 @@ func convertTools(raw json.RawMessage) []converter.Tool {
 	return tools
 }
 
-// decodeToolChoice decodes the raw tool_choice value into a generic structure.
-// Kiro does not consume tool_choice, but it is forwarded on the unified request
-// for completeness.
-func decodeToolChoice(raw json.RawMessage) any {
+// decodeToolChoice decodes Anthropic's auto/any/tool/none policy. Forced choice
+// is represented by filtering tools at the Kiro payload seam.
+func decodeToolChoice(raw json.RawMessage) converter.ToolChoice {
 	if len(raw) == 0 {
+		return converter.ToolChoice{Type: "auto"}
+	}
+	var choice struct {
+		Type               string `json:"type"`
+		Name               string `json:"name"`
+		DisableParallelUse bool   `json:"disable_parallel_tool_use"`
+	}
+	if json.Unmarshal(raw, &choice) != nil {
+		return converter.ToolChoice{Type: "auto"}
+	}
+	return converter.ToolChoice{
+		Type: strings.ToLower(choice.Type), Name: choice.Name,
+		DisableParallelUse: choice.DisableParallelUse,
+	}
+}
+func intPointer(value int) *int {
+	if value <= 0 {
 		return nil
 	}
-	var v any
-	if err := json.Unmarshal(raw, &v); err != nil {
-		return nil
-	}
-	return v
+	return &value
 }
 
-// thinkingConfig interprets the Anthropic thinking parameter:
-// an absent or malformed thinking parameter defaults to enabled (subject to
-// config.FakeReasoningEnabled), an explicit {"type":"disabled"} disables it, and
-// {"type":"enabled","budget_tokens":N} enables it with the requested budget.
-func thinkingConfig(raw json.RawMessage) converter.ThinkingConfig {
-	if len(raw) == 0 {
-		return converter.ThinkingConfig{Enabled: true}
+// thinkingConfig interprets Anthropic adaptive/manual thinking and effort. An
+// explicit output_config.effort wins. Manual budgets are mapped by their share
+// of max_tokens. With no client signal, use Anthropic's documented model
+// default instead of silently forcing Kiro's lowest supported effort.
+func thinkingConfig(req *MessagesRequest) converter.ThinkingConfig {
+	var output struct {
+		Effort string `json:"effort"`
 	}
+	_ = json.Unmarshal(req.OutputConfig, &output)
+
 	var t struct {
 		Type         string `json:"type"`
 		BudgetTokens *int   `json:"budget_tokens"`
 	}
-	if err := json.Unmarshal(raw, &t); err != nil {
-		return converter.ThinkingConfig{Enabled: true}
+	_ = json.Unmarshal(req.Thinking, &t)
+
+	enabled := t.Type != "disabled"
+	effort := normalizeEffort(output.Effort)
+	if effort == "" && t.BudgetTokens != nil && req.MaxTokens > 0 {
+		ratio := float64(*t.BudgetTokens) / float64(req.MaxTokens)
+		switch {
+		case ratio >= 0.90:
+			effort = "xhigh"
+		case ratio >= 0.70:
+			effort = "high"
+		case ratio >= 0.35:
+			effort = "medium"
+		default:
+			effort = "low"
+		}
 	}
-	switch t.Type {
-	case "disabled":
-		return converter.ThinkingConfig{Enabled: false}
-	case "enabled":
-		return converter.ThinkingConfig{Enabled: true, BudgetTokens: t.BudgetTokens}
+	if effort == "" {
+		if strings.Contains(strings.ToLower(req.Model), "opus-5.5") || strings.Contains(strings.ToLower(req.Model), "opus-5-5") {
+			effort = "medium"
+		} else {
+			effort = "high"
+		}
+	}
+	return converter.ThinkingConfig{Enabled: enabled, BudgetTokens: t.BudgetTokens, Effort: effort}
+}
+
+func normalizeEffort(effort string) string {
+	switch effort = strings.ToLower(strings.TrimSpace(effort)); effort {
+	case "low", "medium", "high", "xhigh", "max":
+		return effort
 	default:
-		return converter.ThinkingConfig{Enabled: true}
+		return ""
 	}
 }

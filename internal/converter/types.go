@@ -17,13 +17,12 @@ package converter
 // Note the Go zero value has Enabled=false: adapters that want thinking-tag
 // injection (subject to config.FakeReasoningEnabled) MUST set Enabled=true.
 type ThinkingConfig struct {
-	// Enabled reports whether thinking tags should be injected for this request.
-	// Even when true, injection still requires config.FakeReasoningEnabled.
+	// Enabled reports whether reasoning was requested.
 	Enabled bool
-	// BudgetTokens is the client-requested thinking budget. A nil pointer means
-	// "use config.FakeReasoningMaxTokens". The value is still subject to
-	// config.FakeReasoningBudgetCap.
+	// BudgetTokens is used only by the legacy emulated-thinking fallback.
 	BudgetTokens *int
+	// Effort is the normalized client effort (low/medium/high/xhigh/max).
+	Effort string
 }
 
 // Request is the unified, API-agnostic chat request consumed by
@@ -37,12 +36,17 @@ type Request struct {
 	Messages []Message
 	// Tools is the list of tools available to the model (may be empty).
 	Tools []Tool
-	// ToolChoice carries the API-specific tool_choice value. Kiro does not accept
-	// a tool_choice in the payload, so the core layer keeps it for adapters but
-	// does not serialize it.
-	ToolChoice any
-	// Thinking configures fake-reasoning tag injection.
+	// ToolChoice controls which tools are exposed for this turn. Kiro has no
+	// native tool-choice field, so BuildKiroPayload implements it by filtering.
+	ToolChoice ToolChoice
+	// Generation controls are serialized only when Kiro's live schema advertises
+	// the corresponding field.
+	Generation GenerationConfig
+	// Thinking configures native reasoning when Kiro advertises a schema, or
+	// legacy emulated reasoning otherwise.
 	Thinking ThinkingConfig
+	// ModelRequestSchema is Kiro's live additionalModelRequestFieldsSchema.
+	ModelRequestSchema []byte
 }
 
 // Message is a single unified conversation message.
@@ -117,15 +121,30 @@ type FunctionCall struct {
 	Arguments any
 }
 
+// GenerationConfig carries client generation controls to the schema-gated Kiro
+// request builder. Nil fields mean the client did not specify a value.
+type GenerationConfig struct {
+	MaxTokens   *int
+	Temperature *float64
+	TopP        *float64
+	TopK        *int
+}
+
 // ToolResult is a user-supplied result for a prior tool call, in unified form.
 type ToolResult struct {
 	// ToolUseID references the originating tool call.
 	ToolUseID string
 	// Content is the result content as a string or a []ContentPart.
 	Content any
-	// IsError marks the result as an error result (informational; Kiro always
-	// records results with status "success").
+	// IsError marks a failed tool result; Kiro receives status "error".
 	IsError bool
+}
+
+// ToolChoice is the API-agnostic tool selection policy.
+type ToolChoice struct {
+	Type               string
+	Name               string
+	DisableParallelUse bool
 }
 
 // Tool is a unified tool definition.

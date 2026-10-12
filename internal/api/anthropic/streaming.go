@@ -17,6 +17,7 @@ import (
 	"git.gasi.dev/robin/kiro-proxy/internal/tokenizer"
 	"git.gasi.dev/robin/kiro-proxy/internal/usage"
 	"git.gasi.dev/robin/kiro-proxy/internal/util"
+	"time"
 )
 
 // streamState tracks the open content blocks and accumulated output while
@@ -41,8 +42,12 @@ type streamState struct {
 	textStarted     bool
 	textIndex       int
 	signature       string
+	nativeThinking  bool
+	redactedPending string
 
-	toolCount int
+	toolCount    int
+	stopMatcher  *stopMatcher
+	stopSequence string
 
 	content  strings.Builder
 	thinking strings.Builder
@@ -51,6 +56,8 @@ type streamState struct {
 	creditsUsed *float64
 	cacheRead   *int
 	cacheCreate *int
+	stopReason  string
+	stopDetails map[string]any
 }
 
 // streamMessages translates the unified Kiro event stream (evCh/errCh, produced
@@ -64,13 +71,22 @@ type streamState struct {
 // written: when false the caller may still send a JSON error with a real status
 // code; when true the response is already an event stream and a mid-stream error
 // is emitted as an Anthropic error event.
-func (h *Handler) streamMessages(ctx context.Context, w http.ResponseWriter, am mcp.AuthManager, model string, inputTokens, contextLimit int, asReasoning bool, toolNameReverse map[string]string, evCh <-chan streaming.KiroEvent, errCh <-chan error) (committed bool, err error) {
+func (h *Handler) streamMessages(ctx context.Context, w http.ResponseWriter, am mcp.AuthManager, model string, inputTokens, contextLimit int, asReasoning bool, toolNameReverse map[string]string, stopSequences []string, evCh <-chan streaming.KiroEvent, errCh <-chan error) (committed bool, err error) {
+	interval := 10 * time.Second
+	if h.cfg != nil && h.cfg.AnthropicPingInterval > 0 {
+		interval = time.Duration(h.cfg.AnthropicPingInterval * float64(time.Second))
+	}
+	return h.streamMessagesWithPing(ctx, w, am, model, inputTokens, contextLimit, asReasoning, toolNameReverse, stopSequences, evCh, errCh, interval)
+}
+
+func (h *Handler) streamMessagesWithPing(ctx context.Context, w http.ResponseWriter, am mcp.AuthManager, model string, inputTokens, contextLimit int, asReasoning bool, toolNameReverse map[string]string, stopSequences []string, evCh <-chan streaming.KiroEvent, errCh <-chan error, pingInterval time.Duration) (committed bool, err error) {
 	st := &streamState{
 		messageID:       util.GenerateMessageID(),
 		model:           model,
 		ctx:             ctx,
 		am:              am,
 		toolNameReverse: toolNameReverse,
+		stopMatcher:     newStopMatcher(stopSequences),
 		signature:       genThinkingSignature(),
 	}
 
@@ -94,14 +110,35 @@ func (h *Handler) streamMessages(ctx context.Context, w http.ResponseWriter, am 
 		})
 	}
 
-	for ev := range evCh {
-		if e := ensureStart(); e != nil {
+	ping := time.NewTicker(pingInterval)
+	defer ping.Stop()
+	for evCh != nil {
+		select {
+		case <-ctx.Done():
 			drain(evCh)
-			return true, e
-		}
-		if e := h.processEvent(w, st, asReasoning, ev); e != nil {
-			drain(evCh)
-			return true, e
+			return started, ctx.Err()
+		case <-ping.C:
+			if e := ensureStart(); e != nil {
+				drain(evCh)
+				return true, e
+			}
+			if e := writeSSE(w, "ping", pingEvent{Type: "ping"}); e != nil {
+				drain(evCh)
+				return true, e
+			}
+		case ev, ok := <-evCh:
+			if !ok {
+				evCh = nil
+				continue
+			}
+			if e := ensureStart(); e != nil {
+				drain(evCh)
+				return true, e
+			}
+			if e := h.processEvent(w, st, asReasoning, ev); e != nil {
+				drain(evCh)
+				return true, e
+			}
 		}
 	}
 
@@ -123,9 +160,10 @@ func (h *Handler) streamMessages(ctx context.Context, w http.ResponseWriter, am 
 	}
 
 	if streamErr != nil {
+		_, errType, _, message := classifyUpstreamError(streamErr)
 		_ = writeSSE(w, "error", errorEvent{
 			Type:  "error",
-			Error: errorBody{Type: "api_error", Message: streamErr.Error()},
+			Error: errorBody{Type: errType, Message: message},
 		})
 		return true, streamErr
 	}
@@ -141,8 +179,16 @@ func (h *Handler) streamMessages(ctx context.Context, w http.ResponseWriter, am 
 func (h *Handler) processEvent(w io.Writer, st *streamState, asReasoning bool, ev streaming.KiroEvent) error {
 	switch ev.Type {
 	case streaming.EventThinking:
+		if ev.NativeThinking {
+			st.nativeThinking = true
+			if ev.ThinkingSignature != "" {
+				st.signature = ev.ThinkingSignature
+			}
+			if ev.RedactedThinkingData != "" {
+				st.redactedPending = ev.RedactedThinkingData
+			}
+		}
 		return h.handleThinking(w, st, asReasoning, ev.ThinkingContent)
-
 	case streaming.EventContent:
 		return h.handleContent(w, st, ev.Content)
 
@@ -156,6 +202,12 @@ func (h *Handler) processEvent(w io.Writer, st *streamState, asReasoning bool, e
 	case streaming.EventUsage:
 		applyUsage(st, ev.Usage)
 		return nil
+	case streaming.EventMetadata:
+		if st.stopSequence == "" {
+			st.stopReason = ev.StopReason
+		}
+		st.stopDetails = ev.StopDetails
+		return nil
 	}
 	return nil
 }
@@ -163,14 +215,26 @@ func (h *Handler) processEvent(w io.Writer, st *streamState, asReasoning bool, e
 // handleThinking emits thinking content either as a native Anthropic thinking
 // block (as_reasoning_content) or folded into a text block (otherwise).
 func (h *Handler) handleThinking(w io.Writer, st *streamState, asReasoning bool, content string) error {
-	if content == "" {
+	if content != "" {
+		st.thinking.WriteString(content)
+	}
+	if !asReasoning || (content == "" && st.signature == "" && st.redactedPending == "") {
 		return nil
 	}
-	st.thinking.WriteString(content)
 
-	if !asReasoning {
-		// Fold thinking into a regular text block.
-		return h.handleContent(w, st, content)
+	if st.redactedPending != "" {
+		if err := writeSSE(w, "content_block_start", contentBlockStartEvent{
+			Type: "content_block_start", Index: st.currentIndex,
+			ContentBlock: RedactedThinkingBlock{Type: "redacted_thinking", Data: st.redactedPending},
+		}); err != nil {
+			return err
+		}
+		if err := writeSSE(w, "content_block_stop", contentBlockStopEvent{Type: "content_block_stop", Index: st.currentIndex}); err != nil {
+			return err
+		}
+		st.currentIndex++
+		st.redactedPending = ""
+		return nil
 	}
 
 	if !st.thinkingStarted {
@@ -178,11 +242,14 @@ func (h *Handler) handleThinking(w io.Writer, st *streamState, asReasoning bool,
 		if err := writeSSE(w, "content_block_start", contentBlockStartEvent{
 			Type:         "content_block_start",
 			Index:        st.thinkingIndex,
-			ContentBlock: ThinkingBlock{Type: "thinking", Thinking: "", Signature: st.signature},
+			ContentBlock: ThinkingBlock{Type: "thinking", Thinking: "", Signature: ""},
 		}); err != nil {
 			return err
 		}
 		st.thinkingStarted = true
+	}
+	if content == "" {
+		return nil
 	}
 	return writeSSE(w, "content_block_delta", contentBlockDeltaEvent{
 		Type:  "content_block_delta",
@@ -194,17 +261,31 @@ func (h *Handler) handleThinking(w io.Writer, st *streamState, asReasoning bool,
 // handleContent emits regular text content, closing any open thinking block and
 // opening a text block on demand.
 func (h *Handler) handleContent(w io.Writer, st *streamState, content string) error {
+	if st.stopSequence != "" {
+		return nil
+	}
+	if st.stopMatcher != nil {
+		var matched string
+		content, matched = st.stopMatcher.Feed(content)
+		if matched != "" {
+			st.stopSequence = matched
+			st.stopReason = "STOP_SEQUENCE"
+		}
+	}
 	if content == "" {
 		return nil
 	}
+	return h.emitText(w, st, content)
+}
+
+func (h *Handler) emitText(w io.Writer, st *streamState, content string) error {
 	if err := st.closeThinking(w); err != nil {
 		return err
 	}
 	if !st.textStarted {
 		st.textIndex = st.currentIndex
 		if err := writeSSE(w, "content_block_start", contentBlockStartEvent{
-			Type:         "content_block_start",
-			Index:        st.textIndex,
+			Type: "content_block_start", Index: st.textIndex,
 			ContentBlock: TextBlock{Type: "text", Text: ""},
 		}); err != nil {
 			return err
@@ -213,8 +294,7 @@ func (h *Handler) handleContent(w io.Writer, st *streamState, content string) er
 	}
 	st.content.WriteString(content)
 	return writeSSE(w, "content_block_delta", contentBlockDeltaEvent{
-		Type:  "content_block_delta",
-		Index: st.textIndex,
+		Type: "content_block_delta", Index: st.textIndex,
 		Delta: textDelta{Type: "text_delta", Text: content},
 	})
 }
@@ -395,6 +475,13 @@ func webSearchQuery(argsJSON string) string {
 // finalizeStream closes any open blocks and emits the terminal message_delta and
 // message_stop events, computing output tokens and the final stop reason.
 func (h *Handler) finalizeStream(w io.Writer, st *streamState, contextLimit int) error {
+	if st.stopMatcher != nil && st.stopSequence == "" {
+		if trailing := st.stopMatcher.Flush(); trailing != "" {
+			if err := h.emitText(w, st, trailing); err != nil {
+				return err
+			}
+		}
+	}
 	if err := st.closeThinking(w); err != nil {
 		return err
 	}
@@ -404,21 +491,18 @@ func (h *Handler) finalizeStream(w io.Writer, st *streamState, contextLimit int)
 
 	outputTokens := tokenizer.CountTokens(st.content.String()) + tokenizer.CountTokens(st.thinking.String())
 
-	// Truncation detection: a stream that ended without a
-	// context-usage signal but produced content and no tool calls was cut short.
-	truncated := st.contextPct == 0 && st.content.Len() > 0 && st.toolCount == 0
-
-	stopReason := "end_turn"
-	switch {
-	case truncated:
+	stopReason := anthropicStopReason(st.stopReason, st.toolCount > 0)
+	if stopReason == "end_turn" && st.contextPct == 0 && st.content.Len() > 0 && st.toolCount == 0 {
 		stopReason = "max_tokens"
-	case st.toolCount > 0:
-		stopReason = "tool_use"
 	}
 
+	var matchedSequence *string
+	if st.stopSequence != "" {
+		matchedSequence = &st.stopSequence
+	}
 	if err := writeSSE(w, "message_delta", messageDeltaEvent{
 		Type:  "message_delta",
-		Delta: messageDeltaBody{StopReason: stopReason},
+		Delta: messageDeltaBody{StopReason: stopReason, StopSequence: matchedSequence, StopDetails: st.stopDetails},
 		Usage: DeltaUsage{
 			OutputTokens:             outputTokens,
 			CacheReadInputTokens:     st.cacheRead,
@@ -431,10 +515,34 @@ func (h *Handler) finalizeStream(w io.Writer, st *streamState, contextLimit int)
 	return writeSSE(w, "message_stop", messageStopEvent{Type: "message_stop"})
 }
 
-// closeThinking closes the thinking block if it is open and advances the index.
+func anthropicStopReason(stopReason string, hasTools bool) string {
+	if hasTools || strings.EqualFold(stopReason, "TOOL_USE") {
+		return "tool_use"
+	}
+	switch strings.ToUpper(strings.TrimSpace(stopReason)) {
+	case "MAX_TOKENS":
+		return "max_tokens"
+	case "STOP_SEQUENCE":
+		return "stop_sequence"
+	case "REFUSAL", "CONTENT_FILTERED", "GUARDRAIL_INTERVENED":
+		return "refusal"
+	default:
+		return "end_turn"
+	}
+}
+
+// closeThinking writes the opaque signature before closing a thinking block.
 func (st *streamState) closeThinking(w io.Writer) error {
 	if !st.thinkingStarted {
 		return nil
+	}
+	if st.signature != "" {
+		if err := writeSSE(w, "content_block_delta", contentBlockDeltaEvent{
+			Type: "content_block_delta", Index: st.thinkingIndex,
+			Delta: signatureDelta{Type: "signature_delta", Signature: st.signature},
+		}); err != nil {
+			return err
+		}
 	}
 	st.thinkingStarted = false
 	st.currentIndex++
@@ -459,21 +567,23 @@ func (st *streamState) closeText(w io.Writer) error {
 
 // buildMessagesResponse assembles the non-streaming Messages response from a
 // collected StreamResult, ordering output blocks as thinking, text, tool_use.
-func buildMessagesResponse(result *streaming.StreamResult, model string, inputTokens, contextLimit int, asReasoning bool, toolNameReverse map[string]string) MessagesResponse {
-	blocks := make([]any, 0, 2+len(result.ToolCalls))
+func buildMessagesResponse(result *streaming.StreamResult, model string, inputTokens, contextLimit int, asReasoning bool, toolNameReverse map[string]string, stopSequences ...string) MessagesResponse {
+	blocks := make([]any, 0, 3+len(result.ToolCalls))
 
-	if result.ThinkingContent != "" && asReasoning {
+	if result.RedactedThinkingData != "" && asReasoning {
+		blocks = append(blocks, RedactedThinkingBlock{Type: "redacted_thinking", Data: result.RedactedThinkingData})
+	}
+	if (result.ThinkingContent != "" || result.ThinkingSignature != "") && asReasoning {
+		signature := result.ThinkingSignature
+		if signature == "" {
+			signature = genThinkingSignature()
+		}
 		blocks = append(blocks, ThinkingBlock{
-			Type:      "thinking",
-			Thinking:  result.ThinkingContent,
-			Signature: genThinkingSignature(),
+			Type: "thinking", Thinking: result.ThinkingContent, Signature: signature,
 		})
 	}
 
-	text := result.Content
-	if result.ThinkingContent != "" && !asReasoning {
-		text = result.ThinkingContent + text
-	}
+	text, matchedSequence := truncateAtStopSequence(result.Content, stopSequences)
 	if text != "" {
 		blocks = append(blocks, TextBlock{Type: "text", Text: text})
 	}
@@ -499,13 +609,13 @@ func buildMessagesResponse(result *streaming.StreamResult, model string, inputTo
 		}
 	}
 
-	truncated := result.ContextUsagePercentage == 0 && len(result.Content) > 0 && len(result.ToolCalls) == 0
-	stopReason := "end_turn"
-	switch {
-	case truncated:
+	stopReason := anthropicStopReason(result.StopReason, len(result.ToolCalls) > 0)
+	var stopSequence *string
+	if matchedSequence != "" {
+		stopReason = "stop_sequence"
+		stopSequence = &matchedSequence
+	} else if stopReason == "end_turn" && result.ContextUsagePercentage == 0 && len(result.Content) > 0 && len(result.ToolCalls) == 0 {
 		stopReason = "max_tokens"
-	case len(result.ToolCalls) > 0:
-		stopReason = "tool_use"
 	}
 
 	u := Usage{InputTokens: inputTokens, OutputTokens: outputTokens}
@@ -517,13 +627,15 @@ func buildMessagesResponse(result *streaming.StreamResult, model string, inputTo
 	}
 
 	return MessagesResponse{
-		ID:         util.GenerateMessageID(),
-		Type:       "message",
-		Role:       "assistant",
-		Content:    blocks,
-		Model:      model,
-		StopReason: stopReason,
-		Usage:      u,
+		ID:           util.GenerateMessageID(),
+		Type:         "message",
+		Role:         "assistant",
+		Content:      blocks,
+		Model:        model,
+		StopReason:   stopReason,
+		StopSequence: stopSequence,
+		StopDetails:  result.StopDetails,
+		Usage:        u,
 	}
 }
 

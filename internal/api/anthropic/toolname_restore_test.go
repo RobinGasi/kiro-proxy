@@ -45,3 +45,15 @@ func TestBuildMessagesResponseRestoresToolName(t *testing.T) {
 		t.Fatal("no tool_use block in response")
 	}
 }
+
+func TestAnthropicStopReasonUsesKiroVerdict(t *testing.T) {
+	for _, tt := range []struct {
+		stop  string
+		tools bool
+		want  string
+	}{{"MAX_TOKENS", false, "max_tokens"}, {"END_TURN", false, "end_turn"}, {"STOP_SEQUENCE", false, "stop_sequence"}, {"REFUSAL", false, "refusal"}, {"END_TURN", true, "tool_use"}} {
+		if got := anthropicStopReason(tt.stop, tt.tools); got != tt.want {
+			t.Errorf("anthropicStopReason(%q, %v) = %q, want %q", tt.stop, tt.tools, got, tt.want)
+		}
+	}
+}

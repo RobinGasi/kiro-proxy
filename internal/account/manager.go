@@ -55,12 +55,14 @@ type AccountStats struct {
 
 // Account is a complete Kiro account entity: its authentication, model cache,
 // resolver and runtime circuit-breaker state. All dependencies are lazily
-// initialized on first use by Manager.Pick. Fields are guarded by the owning
-// Manager's mutex; access them through the exported accessors.
+// initialized on first use by Manager.Pick. Account dependency initialization
+// and catalog refresh are guarded per account; circuit state is guarded by the
+// owning Manager's mutex. Access dependencies through the exported accessors.
 type Account struct {
 	id       string
 	authOpts auth.Options // template used for lazy initialization
 
+	initMu   sync.Mutex
 	auth     *auth.KiroAuthManager
 	cache    *modelcache.ModelInfoCache
 	resolver *model.Resolver
@@ -385,55 +387,58 @@ func validCredentialFile(credType, path string) bool {
 // error when no account can be made ready.
 func (m *Manager) Pick(ctx context.Context) (*Account, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	if len(m.accounts) == 0 {
+		m.mu.Unlock()
 		return nil, errors.New("account: no accounts configured")
 	}
 
-	// Single account: bypass the circuit breaker entirely.
+	// Select candidates under the manager lock; perform network I/O after release.
+	selected := make([]*Account, 0, len(m.accounts))
 	if len(m.accounts) == 1 {
-		a := m.accounts[0]
-		if !a.initialized {
-			if err := m.initAccount(ctx, a); err != nil {
-				return nil, fmt.Errorf("account: initialize single account: %w", err)
+		selected = append(selected, m.accounts[0])
+	} else {
+		n := len(m.accounts)
+		start := m.currentIndex
+		for i := range n {
+			a := m.accounts[(start+i)%n]
+			if a.failures > 0 && a.inCooldown(m.recoveryTimeout, m.maxBackoff) {
+				if rand.Float64() > m.probRetry {
+					continue
+				}
+				m.log.Info("probabilistic retry for broken account", "id", a.id)
+			} else if a.failures > 0 {
+				m.log.Info("half-open: recovery timeout passed", "id", a.id)
 			}
+			selected = append(selected, a)
 		}
-		m.maybeRefreshModels(ctx, a)
+	}
+	m.mu.Unlock()
+
+	for _, a := range selected {
+		if err := m.ensureReady(ctx, a); err != nil {
+			m.log.Warn("account initialization failed", "id", a.id, "error", err)
+			m.mu.Lock()
+			a.failures++
+			a.lastFailureTime = time.Now()
+			m.dirty = true
+			m.mu.Unlock()
+			continue
+		}
 		return a, nil
 	}
-
-	n := len(m.accounts)
-	start := m.currentIndex
-	for i := 0; i < n; i++ {
-		idx := (start + i) % n
-		a := m.accounts[idx]
-
-		if a.failures > 0 && a.inCooldown(m.recoveryTimeout, m.maxBackoff) {
-			// Probabilistic retry: most of the time skip a broken account.
-			if rand.Float64() > m.probRetry {
-				continue
-			}
-			m.log.Info("probabilistic retry for broken account", "id", a.id)
-		} else if a.failures > 0 {
-			m.log.Info("half-open: recovery timeout passed", "id", a.id)
-		}
-
-		if !a.initialized {
-			if err := m.initAccount(ctx, a); err != nil {
-				m.log.Warn("account initialization failed", "id", a.id, "error", err)
-				a.failures++
-				a.lastFailureTime = time.Now()
-				m.dirty = true
-				continue
-			}
-		}
-
-		m.maybeRefreshModels(ctx, a)
-		return a, nil
-	}
-
 	return nil, errors.New("account: all accounts unavailable")
+}
+
+func (m *Manager) ensureReady(ctx context.Context, a *Account) error {
+	a.initMu.Lock()
+	defer a.initMu.Unlock()
+	if !a.initialized {
+		if err := m.initAccount(ctx, a); err != nil {
+			return err
+		}
+	}
+	m.maybeRefreshModels(ctx, a)
+	return nil
 }
 
 // inCooldown reports whether the account is still within its (exponentially
@@ -451,7 +456,7 @@ func (a *Account) inCooldown(base time.Duration, maxMultiplier float64) bool {
 }
 
 // initAccount lazily builds the auth manager, verifies credentials, and creates
-// the model cache + resolver. Callers must hold m.mu.
+// the model cache + resolver. The caller must hold a.initMu.
 func (m *Manager) initAccount(ctx context.Context, a *Account) error {
 	opts := a.authOpts
 	opts.HTTPClient = m.hc
@@ -485,14 +490,16 @@ func (m *Manager) initAccount(ctx context.Context, a *Account) error {
 		}
 	}
 	a.modelsCachedAt = time.Now()
+	m.mu.Lock()
 	m.dirty = true
+	m.mu.Unlock()
 
 	m.log.Info("initialized account", "id", a.id, "models", cache.Size())
 	return nil
 }
 
 // maybeRefreshModels refreshes the account's model cache when its TTL has
-// elapsed. Callers must hold m.mu.
+// elapsed. The caller must hold a.initMu.
 func (m *Manager) maybeRefreshModels(ctx context.Context, a *Account) {
 	if m.fetch == nil || a.cache == nil || a.modelsCachedAt.IsZero() {
 		return
@@ -505,7 +512,9 @@ func (m *Manager) maybeRefreshModels(ctx context.Context, a *Account) {
 		return
 	}
 	a.modelsCachedAt = time.Now()
+	m.mu.Lock()
 	m.dirty = true
+	m.mu.Unlock()
 }
 
 // fetchClosure adapts the manager's ModelFetcher to the cache's fetch signature.
@@ -519,16 +528,21 @@ func (m *Manager) fetchClosure(a *Account) func(context.Context) ([]model.Catalo
 // configured fetcher. It is a no-op (returning nil) when no fetcher is set or
 // the account is uninitialized.
 func (m *Manager) RefreshModels(ctx context.Context, a *Account) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.fetch == nil || a == nil || a.cache == nil {
+	if m.fetch == nil || a == nil {
+		return nil
+	}
+	a.initMu.Lock()
+	defer a.initMu.Unlock()
+	if a.cache == nil {
 		return nil
 	}
 	if err := a.cache.Refresh(ctx, m.fetchClosure(a)); err != nil {
 		return err
 	}
 	a.modelsCachedAt = time.Now()
+	m.mu.Lock()
 	m.dirty = true
+	m.mu.Unlock()
 	return nil
 }
 
@@ -678,11 +692,14 @@ func (m *Manager) ReleaseModelProbe(a *Account, modelID string) {
 	a.modelProtections[modelID] = state
 }
 
-// RecordModelSuccess closes model protection after a successful half-open probe
-// and records the normal account success.
+// RecordModelSuccess adds successfully served unknown model IDs to the dynamic
+// list, closes model protection, and records normal account success.
 func (m *Manager) RecordModelSuccess(a *Account, modelID string) {
 	if a == nil {
 		return
+	}
+	if a.cache != nil {
+		a.cache.RecordSuccessfulModel(modelID)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()

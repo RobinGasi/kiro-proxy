@@ -189,6 +189,8 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	}
 
 	convReq := toConverterRequest(&req)
+	convReq.ModelRequestSchema = acct.Resolver().AdditionalModelRequestFieldsSchema(res.InternalID)
+	advertisedTools := converter.SelectedToolNames(convReq.Tools, convReq.ToolChoice)
 
 	// toolNameReverse restores any tool names that BuildKiroPayload aliases to
 	// satisfy Kiro's 64-character limit (nil when nothing was shortened).
@@ -220,19 +222,30 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	debuglog.FromContext(ctx).LogKiroRequestBody(payload)
 	start := func(ctx context.Context) (*http.Response, error) {
 		if attempt > 0 {
+			retryReq := convReq
+			// An answerless Kiro turn is replay-safe. Remove proxy-authored
+			// emulated-thinking tags on recovery so Claude has the full turn for a
+			// final answer/tool call instead of repeating a reasoning-only turn.
+			retryReq.Thinking = converter.ThinkingConfig{Enabled: false}
+			retryModel := currentModelID
 			if fallback := acct.Resolver().NextFamilyFallback(req.Model, currentModelID); fallback != "" {
-				nextPayload, _, buildErr := converter.BuildKiroPayload(ctx, h.cfg, convReq, am.ProfileARN(), fallback)
-				if buildErr != nil {
-					return nil, buildErr
-				}
+				retryModel = fallback
 				h.log.WarnContext(ctx, "openai: retrying bare model with older catalog version",
 					"req_id", util.RequestID(ctx), "stream_attempt", attempt+1,
 					"requested_model", req.Model, "failed_model", currentModelID,
-					"fallback_model", fallback, "fallback_payload_bytes", len(nextPayload))
-				currentModelID = fallback
-				payload = nextPayload
-				debuglog.FromContext(ctx).LogKiroRequestBody(payload)
+					"fallback_model", fallback)
 			}
+			retryReq.ModelRequestSchema = acct.Resolver().AdditionalModelRequestFieldsSchema(retryModel)
+			nextPayload, _, buildErr := converter.BuildKiroPayload(ctx, h.cfg, retryReq, am.ProfileARN(), retryModel)
+			if buildErr != nil {
+				return nil, buildErr
+			}
+			h.log.WarnContext(ctx, "openai: retrying without emulated thinking",
+				"req_id", util.RequestID(ctx), "stream_attempt", attempt+1,
+				"model", retryModel, "payload_bytes", len(nextPayload))
+			currentModelID = retryModel
+			payload = nextPayload
+			debuglog.FromContext(ctx).LogKiroRequestBody(payload)
 		}
 		attempt++
 		return h.upstream.SendConversation(ctx, am, payload, req.Stream)
@@ -248,15 +261,15 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		"reasoning_mode", reasoningMode)
 
 	if req.Stream {
-		h.serveStream(w, r, &req, acct, am, contextLimit, reasoningMode, toolNameReverse, res.InternalID, start)
+		h.serveStream(w, r, &req, acct, am, contextLimit, reasoningMode, toolNameReverse, advertisedTools, res.InternalID, start)
 		return
 	}
-	h.serveNonStream(w, r, &req, acct, contextLimit, reasoningMode, toolNameReverse, res.InternalID, start)
+	h.serveNonStream(w, r, &req, acct, contextLimit, reasoningMode, toolNameReverse, advertisedTools, res.InternalID, start)
 }
 
 // serveStream drives a streaming response.
-func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, req *ChatCompletionRequest, acct *account.Account, am mcp.AuthManager, contextLimit int, reasoningMode string, toolNameReverse map[string]string, modelID string, start func(context.Context) (*http.Response, error)) {
-	evCh, errCh, err := streaming.StreamWithFirstTokenRetry(r.Context(), h.cfg, start)
+func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, req *ChatCompletionRequest, acct *account.Account, am mcp.AuthManager, contextLimit int, reasoningMode string, toolNameReverse map[string]string, advertisedTools []string, modelID string, start func(context.Context) (*http.Response, error)) {
+	evCh, errCh, err := streaming.StreamWithFirstTokenRetryOpts(r.Context(), h.cfg, start, streaming.StreamOptions{EnableThinkingParser: true, AdvertisedTools: advertisedTools})
 	if err != nil {
 		h.accounts.ReleaseModelProbe(acct, modelID)
 		h.accounts.RecordFailure(acct, http.StatusBadGateway, err.Error())
@@ -293,8 +306,8 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, req *ChatC
 }
 
 // serveNonStream drives a non-streaming response.
-func (h *Handler) serveNonStream(w http.ResponseWriter, r *http.Request, req *ChatCompletionRequest, acct *account.Account, contextLimit int, reasoningMode string, toolNameReverse map[string]string, modelID string, start func(context.Context) (*http.Response, error)) {
-	evCh, errCh, err := streaming.StreamWithFirstTokenRetry(r.Context(), h.cfg, start)
+func (h *Handler) serveNonStream(w http.ResponseWriter, r *http.Request, req *ChatCompletionRequest, acct *account.Account, contextLimit int, reasoningMode string, toolNameReverse map[string]string, advertisedTools []string, modelID string, start func(context.Context) (*http.Response, error)) {
+	evCh, errCh, err := streaming.StreamWithFirstTokenRetryOpts(r.Context(), h.cfg, start, streaming.StreamOptions{EnableThinkingParser: true, AdvertisedTools: advertisedTools})
 	if err != nil {
 		h.accounts.ReleaseModelProbe(acct, modelID)
 		h.accounts.RecordFailure(acct, http.StatusBadGateway, err.Error())

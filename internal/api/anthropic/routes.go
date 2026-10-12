@@ -78,6 +78,10 @@ func (h *Handler) handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "Invalid JSON body: "+err.Error())
 		return
 	}
+	if err := validateContentBlocks(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
 
 	acct, err := h.accounts.Pick(ctx)
 	if err != nil {
@@ -132,6 +136,8 @@ func (h *Handler) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	convReq := buildConverterRequest(&req)
+	convReq.ModelRequestSchema = acct.Resolver().AdditionalModelRequestFieldsSchema(res.InternalID)
+	advertisedTools := converter.SelectedToolNames(convReq.Tools, convReq.ToolChoice)
 
 	// toolNameReverse restores any tool names that BuildKiroPayload aliases to
 	// satisfy Kiro's 64-character limit (nil when nothing was shortened).
@@ -163,19 +169,27 @@ func (h *Handler) handleMessages(w http.ResponseWriter, r *http.Request) {
 	debuglog.FromContext(ctx).LogKiroRequestBody(payload)
 	start := func(ctx context.Context) (*http.Response, error) {
 		if attempt > 0 {
+			retryReq := convReq
+			retryReq.Thinking = converter.ThinkingConfig{Enabled: false}
+			retryModel := currentModelID
 			if fallback := acct.Resolver().NextFamilyFallback(req.Model, currentModelID); fallback != "" {
-				nextPayload, _, buildErr := converter.BuildKiroPayload(ctx, h.cfg, convReq, am.ProfileARN(), fallback)
-				if buildErr != nil {
-					return nil, buildErr
-				}
+				retryModel = fallback
 				h.log.WarnContext(ctx, "anthropic: retrying bare model with older catalog version",
 					"req_id", util.RequestID(ctx), "stream_attempt", attempt+1,
 					"requested_model", req.Model, "failed_model", currentModelID,
-					"fallback_model", fallback, "fallback_payload_bytes", len(nextPayload))
-				currentModelID = fallback
-				payload = nextPayload
-				debuglog.FromContext(ctx).LogKiroRequestBody(payload)
+					"fallback_model", fallback)
 			}
+			retryReq.ModelRequestSchema = acct.Resolver().AdditionalModelRequestFieldsSchema(retryModel)
+			nextPayload, _, buildErr := converter.BuildKiroPayload(ctx, h.cfg, retryReq, am.ProfileARN(), retryModel)
+			if buildErr != nil {
+				return nil, buildErr
+			}
+			h.log.WarnContext(ctx, "anthropic: retrying without emulated thinking",
+				"req_id", util.RequestID(ctx), "stream_attempt", attempt+1,
+				"model", retryModel, "payload_bytes", len(nextPayload))
+			currentModelID = retryModel
+			payload = nextPayload
+			debuglog.FromContext(ctx).LogKiroRequestBody(payload)
 		}
 		attempt++
 		return h.upstream.SendConversation(ctx, am, payload, req.Stream)
@@ -191,17 +205,17 @@ func (h *Handler) handleMessages(w http.ResponseWriter, r *http.Request) {
 		"reasoning_mode", h.cfg.FakeReasoningHandling)
 
 	if req.Stream {
-		h.serveStreaming(ctx, w, &req, acct, am, contextLimit, asReasoning, toolNameReverse, res.InternalID, start)
+		h.serveStreaming(ctx, w, &req, acct, am, contextLimit, asReasoning, toolNameReverse, advertisedTools, res.InternalID, start)
 		return
 	}
-	h.serveNonStreaming(ctx, w, &req, acct, contextLimit, asReasoning, toolNameReverse, res.InternalID, start)
+	h.serveNonStreaming(ctx, w, &req, acct, contextLimit, asReasoning, toolNameReverse, advertisedTools, res.InternalID, start)
 }
 
 // serveStreaming drives the SSE response path.
-func (h *Handler) serveStreaming(ctx context.Context, w http.ResponseWriter, req *MessagesRequest, acct *account.Account, am mcp.AuthManager, contextLimit int, asReasoning bool, toolNameReverse map[string]string, modelID string, start func(context.Context) (*http.Response, error)) {
+func (h *Handler) serveStreaming(ctx context.Context, w http.ResponseWriter, req *MessagesRequest, acct *account.Account, am mcp.AuthManager, contextLimit int, asReasoning bool, toolNameReverse map[string]string, advertisedTools []string, modelID string, start func(context.Context) (*http.Response, error)) {
 	inputTokens := h.estimateInputTokens(req, false)
 
-	evCh, errCh, err := streaming.StreamWithFirstTokenRetry(ctx, h.cfg, start)
+	evCh, errCh, err := streaming.StreamWithFirstTokenRetryOpts(ctx, h.cfg, start, streaming.StreamOptions{EnableThinkingParser: true, AdvertisedTools: advertisedTools})
 	if err != nil {
 		h.accounts.ReleaseModelProbe(acct, modelID)
 		h.log.Error("failed to start stream", "error", err)
@@ -209,23 +223,24 @@ func (h *Handler) serveStreaming(ctx context.Context, w http.ResponseWriter, req
 		return
 	}
 
-	committed, streamErr := h.streamMessages(ctx, w, am, req.Model, inputTokens, contextLimit, asReasoning, toolNameReverse, evCh, errCh)
+	committed, streamErr := h.streamMessages(ctx, w, am, req.Model, inputTokens, contextLimit, asReasoning, toolNameReverse, req.StopSequences, evCh, errCh)
 	if streamErr == nil {
 		h.accounts.RecordModelSuccess(acct, modelID)
 		return
 	}
 	if streaming.IsEmptyResponse(streamErr) {
+		protection := h.accounts.ProtectModelAfterEmptyResponse(acct, modelID)
 		if !committed {
-			writeModelProtectionError(w, h.accounts.ProtectModelAfterEmptyResponse(acct, modelID))
+			writeModelProtectionError(w, protection)
 		}
 		return
 	}
 	h.accounts.ReleaseModelProbe(acct, modelID)
 
-	status, reason, message := classifyUpstreamError(streamErr)
+	status, errType, reason, message := classifyUpstreamError(streamErr)
 	h.accounts.RecordFailure(acct, status, reason)
 	if !committed {
-		writeError(w, status, "api_error", message)
+		writeError(w, status, errType, message)
 		return
 	}
 	// The response is already a committed event stream; the error event has been
@@ -234,10 +249,10 @@ func (h *Handler) serveStreaming(ctx context.Context, w http.ResponseWriter, req
 }
 
 // serveNonStreaming drives the single-JSON-response path.
-func (h *Handler) serveNonStreaming(ctx context.Context, w http.ResponseWriter, req *MessagesRequest, acct *account.Account, contextLimit int, asReasoning bool, toolNameReverse map[string]string, modelID string, start func(context.Context) (*http.Response, error)) {
+func (h *Handler) serveNonStreaming(ctx context.Context, w http.ResponseWriter, req *MessagesRequest, acct *account.Account, contextLimit int, asReasoning bool, toolNameReverse map[string]string, advertisedTools []string, modelID string, start func(context.Context) (*http.Response, error)) {
 	inputTokens := h.estimateInputTokens(req, false)
 
-	evCh, errCh, err := streaming.StreamWithFirstTokenRetry(ctx, h.cfg, start)
+	evCh, errCh, err := streaming.StreamWithFirstTokenRetryOpts(ctx, h.cfg, start, streaming.StreamOptions{EnableThinkingParser: true, AdvertisedTools: advertisedTools})
 	if err != nil {
 		h.accounts.ReleaseModelProbe(acct, modelID)
 		h.log.Error("failed to start stream", "error", err)
@@ -252,13 +267,13 @@ func (h *Handler) serveNonStreaming(ctx context.Context, w http.ResponseWriter, 
 			return
 		}
 		h.accounts.ReleaseModelProbe(acct, modelID)
-		status, reason, message := classifyUpstreamError(err)
+		status, errType, reason, message := classifyUpstreamError(err)
 		h.accounts.RecordFailure(acct, status, reason)
-		writeError(w, status, "api_error", message)
+		writeError(w, status, errType, message)
 		return
 	}
 
-	resp := buildMessagesResponse(result, req.Model, inputTokens, contextLimit, asReasoning, toolNameReverse)
+	resp := buildMessagesResponse(result, req.Model, inputTokens, contextLimit, asReasoning, toolNameReverse, req.StopSequences...)
 	h.accounts.RecordModelSuccess(acct, modelID)
 	// Mirror the OpenAI surface: surface remaining credits as a response header
 	// when the upstream usage payload carries them (see openai serveNonStream).
@@ -338,30 +353,45 @@ func messagesAsMaps(req *MessagesRequest) []map[string]any {
 	return msgs
 }
 
-// classifyUpstreamError maps a terminal stream/collection error to an HTTP
-// status, a Kiro error reason (for circuit-breaker classification), and a
-// client-facing message.
-func classifyUpstreamError(err error) (status int, reason string, message string) {
+// classifyUpstreamError maps a terminal error to Anthropic's HTTP and envelope
+// taxonomy while retaining Kiro's reason for account circuit classification.
+func classifyUpstreamError(err error) (status int, errType, reason, message string) {
 	var statusErr *streaming.UpstreamStatusError
 	if errors.As(err, &statusErr) {
 		msg, rsn := parseKiroError(statusErr.Body)
 		if msg == "" {
 			msg = "Upstream API error."
 		}
-		return statusErr.StatusCode, rsn, msg
+		return statusErr.StatusCode, anthropicErrorType(statusErr.StatusCode, rsn, ""), rsn, msg
 	}
 
 	var streamErr *streaming.UpstreamStreamError
 	if errors.As(err, &streamErr) {
-		return http.StatusBadGateway, streamErr.Reason, streamErr.Error()
+		status = http.StatusBadGateway
+		if streamErr.FailureClass == "transient_upstream" {
+			status = 529
+		}
+		return status, anthropicErrorType(status, streamErr.Reason, streamErr.FailureClass), streamErr.Reason, streamErr.Error()
 	}
 
 	var tooLarge *payloadguard.PayloadTooLargeError
 	if errors.As(err, &tooLarge) {
-		return http.StatusBadRequest, "", tooLarge.Error()
+		return http.StatusBadRequest, "invalid_request_error", "CONTENT_LENGTH_EXCEEDS_THRESHOLD", tooLarge.Error()
 	}
+	return http.StatusInternalServerError, "api_error", "", err.Error()
+}
 
-	return http.StatusInternalServerError, "", err.Error()
+func anthropicErrorType(status int, _ string, failureClass string) string {
+	switch {
+	case status == http.StatusTooManyRequests:
+		return "rate_limit_error"
+	case status == 529 || status == http.StatusServiceUnavailable || failureClass == "transient_upstream":
+		return "overloaded_error"
+	case status >= 400 && status < 500:
+		return "invalid_request_error"
+	default:
+		return "api_error"
+	}
 }
 
 // parseKiroError extracts the message and reason from a Kiro error body, which is

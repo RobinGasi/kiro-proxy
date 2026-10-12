@@ -2,7 +2,10 @@ package anthropic
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
+
+	"git.gasi.dev/robin/kiro-proxy/internal/converter"
 )
 
 // Regression for the headline bug: a request with an inline role:"system"
@@ -67,5 +70,31 @@ func TestStringAndBlockContentText(t *testing.T) {
 	}
 	if c2.Text() != "a\nb" {
 		t.Errorf("block text = %q, want %q", c2.Text(), "a\nb")
+	}
+}
+
+func TestValidateContentBlocksRejectsDocuments(t *testing.T) {
+	var req MessagesRequest
+	err := json.Unmarshal([]byte(`{"model":"m","messages":[{"role":"user","content":[{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"AA=="}}]}]}`), &req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateContentBlocks(&req); err == nil {
+		t.Fatal("document block was silently accepted")
+	}
+}
+
+func TestConvertTurnOmitsThinkingButPreservesServerResults(t *testing.T) {
+	var message Message
+	if err := json.Unmarshal([]byte(`{"role":"assistant","content":[{"type":"thinking","thinking":"private","signature":"opaque"},{"type":"redacted_thinking","data":"encrypted"},{"type":"web_search_tool_result","tool_use_id":"srv_1","content":[{"type":"web_search_result","title":"Result"}]},{"type":"text","text":"answer"}]}`), &message); err != nil {
+		t.Fatal(err)
+	}
+	converted := convertTurn(message)
+	text := converter.ExtractTextContent(converted.Content)
+	if strings.Contains(text, "private") || strings.Contains(text, "opaque") || strings.Contains(text, "encrypted") {
+		t.Fatalf("thinking metadata leaked into Kiro text: %q", text)
+	}
+	if !strings.Contains(text, "web_search_tool_result") || !strings.Contains(text, "answer") {
+		t.Fatalf("server result context was lost: %q", text)
 	}
 }

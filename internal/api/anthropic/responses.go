@@ -30,12 +30,19 @@ type DeltaUsage struct {
 
 // --- Output content blocks ---
 
-// ThinkingBlock is a thinking/reasoning output block. The signature is a
-// placeholder (this proxy emits fake-reasoning content, not signed thinking).
+// ThinkingBlock is a thinking/reasoning output block. Signature is the opaque
+// upstream signature when Kiro provides one; legacy emulated reasoning uses a
+// generated compatibility signature.
 type ThinkingBlock struct {
 	Type      string `json:"type"`
 	Thinking  string `json:"thinking"`
 	Signature string `json:"signature"`
+}
+
+// RedactedThinkingBlock preserves opaque provider-redacted reasoning.
+type RedactedThinkingBlock struct {
+	Type string `json:"type"`
+	Data string `json:"data"`
 }
 
 // TextBlock is a text output block.
@@ -55,14 +62,15 @@ type ToolUseBlock struct {
 // MessagesResponse is the non-streaming response from POST /v1/messages.
 // Content holds the ordered output blocks (thinking, text, tool_use).
 type MessagesResponse struct {
-	ID           string  `json:"id"`
-	Type         string  `json:"type"`
-	Role         string  `json:"role"`
-	Content      []any   `json:"content"`
-	Model        string  `json:"model"`
-	StopReason   string  `json:"stop_reason"`
-	StopSequence *string `json:"stop_sequence"`
-	Usage        Usage   `json:"usage"`
+	ID           string         `json:"id"`
+	Type         string         `json:"type"`
+	Role         string         `json:"role"`
+	Content      []any          `json:"content"`
+	Model        string         `json:"model"`
+	StopReason   string         `json:"stop_reason"`
+	StopSequence *string        `json:"stop_sequence"`
+	StopDetails  map[string]any `json:"stop_details,omitempty"`
+	Usage        Usage          `json:"usage"`
 }
 
 // --- Streaming events ---
@@ -118,6 +126,13 @@ type thinkingDelta struct {
 	Thinking string `json:"thinking"`
 }
 
+// signatureDelta carries the opaque thinking signature immediately before the
+// thinking content block closes.
+type signatureDelta struct {
+	Type      string `json:"type"`
+	Signature string `json:"signature"`
+}
+
 // inputJSONDelta is an input_json_delta payload for streaming tool input.
 type inputJSONDelta struct {
 	Type        string `json:"type"`
@@ -131,10 +146,11 @@ type messageDeltaEvent struct {
 	Usage DeltaUsage       `json:"usage"`
 }
 
-// messageDeltaBody holds the stop reason and (optional) stop sequence.
+// messageDeltaBody holds Kiro's terminal verdict in Anthropic form.
 type messageDeltaBody struct {
-	StopReason   string  `json:"stop_reason"`
-	StopSequence *string `json:"stop_sequence"`
+	StopReason   string         `json:"stop_reason"`
+	StopSequence *string        `json:"stop_sequence"`
+	StopDetails  map[string]any `json:"stop_details,omitempty"`
 }
 
 // messageStopEvent ends a message stream.

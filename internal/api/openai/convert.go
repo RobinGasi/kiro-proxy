@@ -23,15 +23,37 @@ func toConverterRequest(req *ChatCompletionRequest) converter.Request {
 		System:   system,
 		Messages: messages,
 		Tools:    convertTools(req.Tools),
+		Generation: converter.GenerationConfig{
+			MaxTokens:   firstNonNilInt(req.MaxCompletion, req.MaxTokens),
+			Temperature: req.Temperature, TopP: req.TopP,
+		},
 		Thinking: extractThinking(req),
 	}
 	if len(req.ToolChoice) > 0 {
-		var tc any
-		if err := json.Unmarshal(req.ToolChoice, &tc); err == nil {
-			out.ToolChoice = tc
+		var tc struct {
+			Type     string `json:"type"`
+			Name     string `json:"name"`
+			Function struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		}
+		if json.Unmarshal(req.ToolChoice, &tc) == nil {
+			if tc.Name == "" {
+				tc.Name = tc.Function.Name
+			}
+			out.ToolChoice = converter.ToolChoice{Type: strings.ToLower(tc.Type), Name: tc.Name}
 		}
 	}
 	return out
+}
+
+func firstNonNilInt(values ...*int) *int {
+	for _, value := range values {
+		if value != nil && *value > 0 {
+			return value
+		}
+	}
+	return nil
 }
 
 // convertMessages converts OpenAI messages to (systemPrompt, unifiedMessages).
@@ -298,7 +320,7 @@ func extractThinking(req *ChatCompletionRequest) converter.ThinkingConfig {
 		maxTokens = 4096
 	}
 	budget := reasoningEffortBudget(maxTokens, effort)
-	cfg := converter.ThinkingConfig{Enabled: true}
+	cfg := converter.ThinkingConfig{Enabled: true, Effort: effort}
 	if budget > 0 {
 		cfg.BudgetTokens = &budget
 	}

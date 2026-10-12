@@ -1,18 +1,11 @@
-// Package awsstream parses Kiro's AWS event-stream HTTP response chunks.
+// Package awsstream parses Kiro's AWS EventStream responses.
 //
-// Despite the upstream name, this parser does NOT decode the binary AWS
-// event-stream frame envelope. Instead it decodes each incoming chunk as UTF-8
-// (dropping undecodable bytes) and scans the accumulated text for embedded JSON
-// events, reconstructing streaming tool calls as it goes.
+// FeedStream decodes and CRC-validates the binary frame envelope, routes frames
+// by :message-type / :event-type, and preserves metadata, reasoning, errors and
+// unknown union members. Feed retains the legacy embedded-JSON scanner for
+// plain-JSON fixtures and compatible legacy upstreams.
 //
-// Supported event types extracted from the stream:
-//
-//   - content       text content of the response
-//   - usage         credit-consumption information
-//   - context_usage context-usage percentage
-//
-// Tool-call related JSON fragments (tool_start / tool_input / tool_stop) do not
-// produce Events; they are accumulated internally and retrieved via
+// Tool-call frames are accumulated internally and retrieved through
 // (*Parser).GetToolCalls.
 package awsstream
 
@@ -28,21 +21,23 @@ import (
 	"git.gasi.dev/robin/kiro-proxy/internal/util"
 )
 
-// Event type identifiers returned by (*Parser).Feed.
+// Event type identifiers returned by (*Parser).FeedStream.
 const (
 	EventContent      = "content"
+	EventReasoning    = "reasoning"
 	EventUsage        = "usage"
 	EventContextUsage = "context_usage"
+	EventMetadata     = "metadata"
+	EventError        = "error"
+	EventIgnored      = "ignored"
 )
 
-// Event is a single parsed stream event. Data depends on Type:
-//
-//   - EventContent:      string content fragment
-//   - EventUsage:        the raw "usage" value (number/object), 0 if absent
-//   - EventContextUsage: the raw "contextUsagePercentage" value, 0 if absent
+// Event is one parsed stream event. Data depends on Type; UpstreamType retains
+// the Smithy union member carried by the :event-type frame header.
 type Event struct {
-	Type string
-	Data any
+	Type         string
+	UpstreamType string
+	Data         any
 }
 
 // ToolCallFunction is the function payload of a reconstructed tool call.
@@ -88,14 +83,29 @@ var bracketRe = regexp.MustCompile(`(?i)\[Called\s+(\w+)\s+with\s+args:\s*`)
 // Parser is a stateful AWS event-stream parser. It is not safe for concurrent
 // use. Construct one with NewParser.
 type Parser struct {
-	buffer          string
-	lastContent     *string // last emitted content, for deduplication
+	buffer      string
+	frameBuffer []byte
+	streamMode  streamMode
+	lastContent *string // last emitted content, for deduplication
+
+	// currentToolCall is retained for the legacy plain-JSON scanner.
 	currentToolCall *ToolCall
 	toolCalls       []*ToolCall
+	// streamTools assembles binary toolUseEvent fragments by identity. Multiple
+	// calls may be interleaved; streamToolOrder preserves first-seen order.
+	streamTools     map[string]*streamToolState
+	streamToolOrder []string
 
 	// TruncationRecovery only influences the wording of truncation log
 	// messages; it mirrors the TRUNCATION_RECOVERY config flag. Defaults false.
 	TruncationRecovery bool
+}
+
+type streamToolState struct {
+	call        ToolCall
+	arguments   string
+	complete    bool
+	generatedID bool
 }
 
 // NewParser returns a ready-to-use Parser.
@@ -103,9 +113,8 @@ func NewParser() *Parser {
 	return &Parser{}
 }
 
-// BufferedText returns stream text that did not match a supported event. It is
-// used at EOF to recover upstream exception payloads carried inside HTTP 200
-// event streams. Callers should inspect it only after feeding is complete.
+// BufferedText returns unmatched data retained by the legacy plain-JSON parser.
+// Binary framing errors are returned directly by FeedStream and FlushStream.
 func (p *Parser) BufferedText() string {
 	if p == nil {
 		return ""
@@ -113,8 +122,8 @@ func (p *Parser) BufferedText() string {
 	return p.buffer
 }
 
-// Feed appends a chunk to the internal buffer and returns any newly completed
-// events. Incomplete JSON is retained for subsequent calls.
+// Feed runs the legacy embedded-JSON scanner. Production streaming uses
+// FeedStream, which decodes the actual AWS EventStream envelope.
 func (p *Parser) Feed(chunk []byte) []Event {
 	p.buffer += decodeIgnore(chunk)
 
@@ -246,6 +255,160 @@ func (p *Parser) processToolStopEvent(data map[string]any) {
 	}
 }
 
+// processToolFrame assembles one Kiro toolUseEvent. Kiro repeats name and
+// toolUseId on input-delta frames, so field presence cannot distinguish start
+// from continuation. Calls are keyed by ID because Kiro may interleave them.
+func (p *Parser) processToolFrame(data map[string]any) error {
+	if len(data) == 0 {
+		return fmt.Errorf("awsstream: empty toolUseEvent")
+	}
+	idValue, idPresent := data["toolUseId"]
+	toolID, idOK := idValue.(string)
+	if idPresent && (!idOK || strings.TrimSpace(toolID) == "") {
+		return fmt.Errorf("awsstream: invalid toolUseId in toolUseEvent")
+	}
+	nameValue, namePresent := data["name"]
+	name, nameOK := nameValue.(string)
+	if namePresent && (!nameOK || strings.TrimSpace(name) == "") {
+		return fmt.Errorf("awsstream: invalid tool name in toolUseEvent")
+	}
+
+	state, err := p.findStreamTool(toolID, name)
+	if err != nil {
+		return err
+	}
+	if state == nil {
+		if name == "" {
+			return fmt.Errorf("awsstream: new toolUseEvent is missing a tool name")
+		}
+		generated := toolID == ""
+		if generated {
+			toolID = util.GenerateToolCallID()
+		}
+		if p.streamTools == nil {
+			p.streamTools = make(map[string]*streamToolState)
+		}
+		state = &streamToolState{
+			call:        ToolCall{ID: toolID, Type: "function", Function: ToolCallFunction{Name: name}},
+			generatedID: generated,
+		}
+		p.streamTools[toolID] = state
+		p.streamToolOrder = append(p.streamToolOrder, toolID)
+	} else if name != "" && state.call.Function.Name != name {
+		return fmt.Errorf("awsstream: tool name changed for toolUseId %q", state.call.ID)
+	}
+	if state.complete {
+		if isTruthy(data["stop"]) {
+			return nil // idempotent duplicate terminal frame
+		}
+		return fmt.Errorf("awsstream: toolUseEvent for completed toolUseId %q", state.call.ID)
+	}
+
+	if input, ok := data["input"]; ok {
+		if err := appendStreamToolInput(state, input); err != nil {
+			return fmt.Errorf("awsstream: toolUseId %q: %w", state.call.ID, err)
+		}
+	}
+	if isTruthy(data["stop"]) {
+		normalized := "{}"
+		if strings.TrimSpace(state.arguments) != "" {
+			var ok bool
+			normalized, ok = reencodeJSON(state.arguments)
+			if !ok {
+				return fmt.Errorf("awsstream: invalid completed tool arguments: %s", diagnoseJSONTruncation(state.arguments).Reason)
+			}
+		}
+		state.call.Function.Arguments = normalized
+		state.complete = true
+	}
+	return nil
+}
+
+func (p *Parser) findStreamTool(toolID, name string) (*streamToolState, error) {
+	if toolID != "" {
+		if state := p.streamTools[toolID]; state != nil {
+			return state, nil
+		}
+		var generatedKey string
+		for id, state := range p.streamTools {
+			if state.generatedID && !state.complete && (name == "" || state.call.Function.Name == name) {
+				if generatedKey != "" {
+					return nil, fmt.Errorf("awsstream: ambiguous toolUseId rekey")
+				}
+				generatedKey = id
+			}
+		}
+		if generatedKey == "" {
+			return nil, nil
+		}
+		state := p.streamTools[generatedKey]
+		delete(p.streamTools, generatedKey)
+		p.streamTools[toolID] = state
+		state.call.ID = toolID
+		state.generatedID = false
+		for i, id := range p.streamToolOrder {
+			if id == generatedKey {
+				p.streamToolOrder[i] = toolID
+				break
+			}
+		}
+		return state, nil
+	}
+
+	var found *streamToolState
+	for _, state := range p.streamTools {
+		if state.complete || (name != "" && state.call.Function.Name != name) {
+			continue
+		}
+		if found != nil {
+			return nil, fmt.Errorf("awsstream: ambiguous toolUseEvent without toolUseId")
+		}
+		found = state
+	}
+	return found, nil
+}
+
+func appendStreamToolInput(state *streamToolState, input any) error {
+	switch value := input.(type) {
+	case nil:
+		return nil
+	case string:
+		state.arguments += value
+		return nil
+	case map[string]any:
+		// Kiro commonly starts a tool with input:{} and streams the actual JSON
+		// afterward. An empty object is a start marker, not an argument snapshot.
+		if len(value) == 0 {
+			return nil
+		}
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return fmt.Errorf("encode tool input snapshot: %w", err)
+		}
+		return replaceStreamToolSnapshot(state, string(encoded))
+	case []any:
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return fmt.Errorf("encode tool input snapshot: %w", err)
+		}
+		return replaceStreamToolSnapshot(state, string(encoded))
+	default:
+		return fmt.Errorf("unsupported tool input type %T", input)
+	}
+}
+
+func replaceStreamToolSnapshot(state *streamToolState, snapshot string) error {
+	if state.arguments == "" || state.arguments == snapshot {
+		state.arguments = snapshot
+		return nil
+	}
+	if _, ok := reencodeJSON(state.arguments); ok {
+		state.arguments = snapshot
+		return nil
+	}
+	return fmt.Errorf("input snapshot followed an incomplete string delta")
+}
+
 // finalizeToolCall normalizes the current tool call's arguments and stores it.
 func (p *Parser) finalizeToolCall() {
 	tc := p.currentToolCall
@@ -297,9 +460,18 @@ func (p *Parser) finalizeToolCall() {
 	p.currentToolCall = nil
 }
 
-// GetToolCalls finalizes any in-progress tool call and returns the deduplicated
-// list of reconstructed tool calls.
+// GetToolCalls returns completed binary calls in first-seen order. Legacy
+// plain-JSON parsing retains its historical single-call finalization behavior.
 func (p *Parser) GetToolCalls() []ToolCall {
+	if p.streamMode == streamModeBinary {
+		all := make([]ToolCall, 0, len(p.streamToolOrder))
+		for _, id := range p.streamToolOrder {
+			if state := p.streamTools[id]; state != nil && state.complete {
+				all = append(all, state.call)
+			}
+		}
+		return DeduplicateToolCalls(all)
+	}
 	if p.currentToolCall != nil {
 		p.finalizeToolCall()
 	}
@@ -315,9 +487,13 @@ func (p *Parser) GetToolCalls() []ToolCall {
 // Reset clears all parser state so the Parser can be reused.
 func (p *Parser) Reset() {
 	p.buffer = ""
+	p.frameBuffer = nil
+	p.streamMode = streamModeUnknown
 	p.lastContent = nil
 	p.currentToolCall = nil
 	p.toolCalls = nil
+	p.streamTools = nil
+	p.streamToolOrder = nil
 }
 
 // FindMatchingBrace returns the index of the closing brace matching the opening
@@ -404,6 +580,151 @@ func ParseBracketToolCalls(responseText string) []ToolCall {
 		})
 	}
 	return toolCalls
+}
+
+var taggedToolNames = []string{"tool_use", "tool_call", "function_call", "tool"}
+
+// ParseTaggedToolCalls recovers Opus-class tool descriptors emitted as tagged
+// text. Only advertised tool names (or narrow unambiguous aliases) are accepted;
+// malformed, fenced, incomplete, or unknown calls remain ordinary text.
+func ParseTaggedToolCalls(text string, advertised []string) (string, []ToolCall) {
+	allowed := make(map[string]string, len(advertised))
+	for _, name := range advertised {
+		allowed[strings.ToLower(name)] = name
+	}
+	if len(allowed) == 0 || text == "" {
+		return text, nil
+	}
+	type span struct{ start, end int }
+	var spans []span
+	var calls []ToolCall
+	for cursor := 0; cursor < len(text); {
+		start, tag := nextTaggedTool(text, cursor)
+		if start < 0 {
+			break
+		}
+		open, close := "<"+tag+">", "</"+tag+">"
+		bodyStart := start + len(open)
+		closeAt := strings.Index(text[bodyStart:], close)
+		if closeAt < 0 {
+			break
+		}
+		closeAt += bodyStart
+		end := closeAt + len(close)
+		if insideFence(text, start) {
+			cursor = end
+			continue
+		}
+		body := strings.TrimSpace(text[bodyStart:closeAt])
+		if len(body) == 0 || body[0] != '{' || FindMatchingBrace(body, 0) != len(body)-1 {
+			cursor = end
+			continue
+		}
+		var raw any
+		if json.Unmarshal([]byte(body), &raw) != nil {
+			cursor = end
+			continue
+		}
+		descriptors, ok := taggedDescriptors(raw, allowed)
+		if !ok || len(descriptors) == 0 {
+			cursor = end
+			continue
+		}
+		calls = append(calls, descriptors...)
+		spans = append(spans, span{start, end})
+		cursor = end
+	}
+	for i := len(spans) - 1; i >= 0; i-- {
+		text = text[:spans[i].start] + text[spans[i].end:]
+	}
+	return text, calls
+}
+
+func nextTaggedTool(text string, from int) (int, string) {
+	best, tag := -1, ""
+	for _, candidate := range taggedToolNames {
+		at := strings.Index(text[from:], "<"+candidate+">")
+		if at >= 0 {
+			at += from
+			if best < 0 || at < best {
+				best, tag = at, candidate
+			}
+		}
+	}
+	return best, tag
+}
+
+func insideFence(text string, position int) bool {
+	return strings.Count(text[:position], "```")%2 == 1
+}
+
+func taggedDescriptors(raw any, allowed map[string]string) ([]ToolCall, bool) {
+	values := []any{raw}
+	if object, ok := raw.(map[string]any); ok {
+		if wrapped, exists := object["tool_calls"]; exists {
+			values, ok = wrapped.([]any)
+			if !ok {
+				return nil, false
+			}
+		} else if wrapped, exists := object["calls"]; exists {
+			values, ok = wrapped.([]any)
+			if !ok {
+				return nil, false
+			}
+		}
+	}
+	result := make([]ToolCall, 0, len(values))
+	for _, value := range values {
+		object, ok := value.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		name, _ := object["tool_name"].(string)
+		if name == "" {
+			name, _ = object["name"].(string)
+		}
+		canonical, ok := advertisedToolName(name, allowed)
+		if !ok {
+			return nil, false
+		}
+		arguments := object["tool_input"]
+		if arguments == nil {
+			arguments = object["input"]
+		}
+		if arguments == nil {
+			arguments = object["arguments"]
+		}
+		if arguments == nil {
+			arguments = map[string]any{}
+		}
+		if _, ok := arguments.(map[string]any); !ok {
+			return nil, false
+		}
+		encoded, err := json.Marshal(arguments)
+		if err != nil {
+			return nil, false
+		}
+		result = append(result, ToolCall{ID: util.GenerateToolCallID(), Type: "function", Function: ToolCallFunction{Name: canonical, Arguments: string(encoded)}})
+	}
+	return result, true
+}
+
+func advertisedToolName(name string, allowed map[string]string) (string, bool) {
+	if canonical, ok := allowed[strings.ToLower(name)]; ok {
+		return canonical, true
+	}
+	aliases := map[string]string{
+		"read_file": "read", "readfile": "read", "fs_read": "read", "view_file": "read",
+		"write_file": "write", "writefile": "write", "fs_write": "write", "create_file": "write",
+		"edit_file": "edit", "editfile": "edit", "str_replace": "edit", "str_replace_editor": "edit", "apply_patch": "edit",
+		"list_directory": "ls", "list_dir": "ls", "list_files": "ls", "find_files": "find", "file_search": "find",
+	}
+	target, ok := aliases[strings.ToLower(name)]
+	if !ok {
+		return "", false
+	}
+	canonical, ok := allowed[target]
+	return canonical, ok
 }
 
 // DeduplicateToolCalls removes duplicate tool calls. It first deduplicates by id

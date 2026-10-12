@@ -13,6 +13,7 @@ import (
 	"git.gasi.dev/robin/kiro-proxy/internal/converter"
 	"git.gasi.dev/robin/kiro-proxy/internal/mcp"
 	"git.gasi.dev/robin/kiro-proxy/internal/streaming"
+	"git.gasi.dev/robin/kiro-proxy/internal/thinking"
 	"git.gasi.dev/robin/kiro-proxy/internal/usage"
 	"git.gasi.dev/robin/kiro-proxy/internal/util"
 )
@@ -30,7 +31,9 @@ type streamAccumulator struct {
 	toolCalls     []awsstream.ToolCall
 	usageRaw      map[string]any
 	contextPct    float64
-	reasoningMode string // cfg.FakeReasoningHandling
+	stopReason    string
+	stopDetails   map[string]any
+	reasoningMode string
 	// toolNameReverse restores tool names that were aliased to satisfy Kiro's
 	// 64-character limit (nil when nothing was shortened).
 	toolNameReverse map[string]string
@@ -51,14 +54,28 @@ func (a *streamAccumulator) apply(ev streaming.KiroEvent) map[string]any {
 		a.content += ev.Content
 		return map[string]any{"content": ev.Content}
 	case streaming.EventThinking:
-		if ev.ThinkingContent == "" {
+		if ev.ThinkingContent != "" {
+			a.thinking += ev.ThinkingContent
+		}
+		switch a.reasoningMode {
+		case thinking.HandleAsReasoningContent:
+			if ev.ThinkingContent == "" {
+				return nil
+			}
+			return map[string]any{"reasoning_content": ev.ThinkingContent}
+		case thinking.HandlePass:
+			if ev.ThinkingContent == "" {
+				return nil
+			}
+			return map[string]any{"content": "<thinking>" + ev.ThinkingContent + "</thinking>"}
+		case thinking.HandleStripTags:
+			if ev.ThinkingContent == "" {
+				return nil
+			}
+			return map[string]any{"content": ev.ThinkingContent}
+		default: // remove and unknown modes are fail-closed.
 			return nil
 		}
-		a.thinking += ev.ThinkingContent
-		if a.reasoningMode == "as_reasoning_content" {
-			return map[string]any{"reasoning_content": ev.ThinkingContent}
-		}
-		return map[string]any{"content": ev.ThinkingContent}
 	case streaming.EventToolUse:
 		if ev.ToolCall != nil {
 			a.toolCalls = append(a.toolCalls, *ev.ToolCall)
@@ -70,14 +87,21 @@ func (a *streamAccumulator) apply(ev streaming.KiroEvent) map[string]any {
 	case streaming.EventContextUsage:
 		a.contextPct = ev.ContextUsagePercentage
 		return nil
+	case streaming.EventMetadata:
+		a.stopReason = ev.StopReason
+		a.stopDetails = ev.StopDetails
+		return nil
 	}
 	return nil
 }
 
-// finishReason returns the OpenAI finish_reason for the accumulated stream.
+// finishReason maps Kiro's terminal verdict to OpenAI semantics.
 func (a *streamAccumulator) finishReason() string {
-	if len(a.toolCalls) > 0 {
+	if len(a.toolCalls) > 0 || strings.EqualFold(a.stopReason, "TOOL_USE") {
 		return "tool_calls"
+	}
+	if strings.EqualFold(a.stopReason, "MAX_TOKENS") {
+		return "length"
 	}
 	return "stop"
 }
@@ -195,48 +219,52 @@ func streamToWriter(ctx context.Context, mcpClient *mcp.Client, am mcp.AuthManag
 		process(ev)
 	}
 	streamErr := <-errCh
+	if streamErr != nil {
+		// Headers/output are already committed. Emit an explicit terminal error and
+		// do not append a normal finish_reason or [DONE] success marker.
+		payload, _ := json.Marshal(map[string]any{"error": map[string]any{
+			"message": streamErr.Error(), "type": "kiro_api_error", "code": http.StatusBadGateway,
+		}})
+		writeRaw(w, flusher, "data: "+string(payload)+"\n\n")
+		return streamErr
+	}
 
-	// Tool-calls chunk (single chunk carrying all calls).
 	if len(acc.toolCalls) > 0 {
 		writeChunk(w, flusher, ChatCompletionChunk{
-			ID:      completionID,
-			Object:  objectChunk,
-			Created: created,
-			Model:   model,
-			Choices: []ChatCompletionChunkChoice{{
-				Index: 0,
-				Delta: map[string]any{"tool_calls": acc.indexedToolCalls()},
-			}},
+			ID: completionID, Object: objectChunk, Created: created, Model: model,
+			Choices: []ChatCompletionChunkChoice{{Index: 0, Delta: map[string]any{"tool_calls": acc.indexedToolCalls()}}},
 		})
 	}
 
-	// Final chunk: finish_reason + usage.
 	finish := acc.finishReason()
 	u := acc.usage(contextLimit)
 	writeChunk(w, flusher, ChatCompletionChunk{
-		ID:      completionID,
-		Object:  objectChunk,
-		Created: created,
-		Model:   model,
-		Choices: []ChatCompletionChunkChoice{{Index: 0, Delta: map[string]any{}, FinishReason: &finish}},
-		Usage:   &u,
+		ID: completionID, Object: objectChunk, Created: created, Model: model,
+		Choices: []ChatCompletionChunkChoice{{Index: 0, Delta: map[string]any{}, FinishReason: &finish}}, Usage: &u,
 	})
-
 	writeRaw(w, flusher, "data: [DONE]\n\n")
-	return streamErr
+	return nil
 }
 
 // buildNonStreamingResponse collects a complete StreamResult into one
 // chat.completion object.
 func buildNonStreamingResponse(model string, contextLimit int, reasoningMode string, toolNameReverse map[string]string, res *streaming.StreamResult) ChatCompletionResponse {
-	message := map[string]any{"role": "assistant", "content": res.Content}
-	if res.ThinkingContent != "" && reasoningMode == "as_reasoning_content" {
+	content := res.Content
+	if res.ThinkingContent != "" {
+		switch reasoningMode {
+		case thinking.HandlePass:
+			content = "<thinking>" + res.ThinkingContent + "</thinking>" + content
+		case thinking.HandleStripTags:
+			content = res.ThinkingContent + content
+		}
+	}
+	message := map[string]any{"role": "assistant", "content": content}
+	if res.ThinkingContent != "" && reasoningMode == thinking.HandleAsReasoningContent {
 		message["reasoning_content"] = res.ThinkingContent
 	}
 
-	finish := "stop"
+	finish := openAIFinishReason(res.StopReason, len(res.ToolCalls) > 0)
 	if len(res.ToolCalls) > 0 {
-		finish = "tool_calls"
 		calls := make([]map[string]any, 0, len(res.ToolCalls))
 		for _, tc := range res.ToolCalls {
 			args := tc.Function.Arguments
@@ -271,6 +299,16 @@ func buildNonStreamingResponse(model string, contextLimit int, reasoningMode str
 		Choices: []ChatCompletionChoice{{Index: 0, Message: message, FinishReason: finish}},
 		Usage:   u,
 	}
+}
+
+func openAIFinishReason(stopReason string, hasTools bool) string {
+	if hasTools || strings.EqualFold(stopReason, "TOOL_USE") {
+		return "tool_calls"
+	}
+	if strings.EqualFold(stopReason, "MAX_TOKENS") {
+		return "length"
+	}
+	return "stop"
 }
 
 // creditsRemaining extracts a remaining-credits hint from a usage payload for

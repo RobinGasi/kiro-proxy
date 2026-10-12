@@ -91,3 +91,15 @@ func TestWriteModelProtectionErrorAllowsClientModelFallback(t *testing.T) {
 		t.Fatalf("message = %q, want actionable model-switch guidance", response.Error.Message)
 	}
 }
+
+func TestOpenAIFinishReasonUsesKiroVerdict(t *testing.T) {
+	for _, tt := range []struct {
+		stop  string
+		tools bool
+		want  string
+	}{{"MAX_TOKENS", false, "length"}, {"END_TURN", false, "stop"}, {"TOOL_USE", false, "tool_calls"}, {"END_TURN", true, "tool_calls"}} {
+		if got := openAIFinishReason(tt.stop, tt.tools); got != tt.want {
+			t.Errorf("openAIFinishReason(%q, %v) = %q, want %q", tt.stop, tt.tools, got, tt.want)
+		}
+	}
+}

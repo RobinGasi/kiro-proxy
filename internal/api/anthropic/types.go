@@ -22,6 +22,7 @@ type MessagesRequest struct {
 	System        SystemField     `json:"system,omitzero"`
 	Stream        bool            `json:"stream,omitempty"`
 	Thinking      json.RawMessage `json:"thinking,omitempty"`
+	OutputConfig  json.RawMessage `json:"output_config,omitempty"`
 	Tools         json.RawMessage `json:"tools,omitempty"`
 	ToolChoice    json.RawMessage `json:"tool_choice,omitempty"`
 	Temperature   *float64        `json:"temperature,omitempty"`

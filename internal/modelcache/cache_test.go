@@ -37,7 +37,7 @@ func TestRefreshStoresCapabilities(t *testing.T) {
 
 	err := c.Refresh(context.Background(), func(context.Context) ([]model.CatalogModel, error) {
 		return []model.CatalogModel{
-			{ID: "gpt-5.6-sol", Capabilities: model.Capabilities{MaxInputTokens: 272_000, MaxOutputTokens: 128_000}},
+			{ID: "gpt-5.6-sol", Capabilities: model.Capabilities{MaxInputTokens: 272_000, MaxOutputTokens: 128_000}, AdditionalModelRequestFieldsSchema: []byte(`{"properties":{"reasoning":{}}}`)},
 			// Kiro omitted limits for this entry.
 			{ID: "mystery-model"},
 			// Empty ids and duplicates are dropped; the first occurrence wins.
@@ -54,6 +54,14 @@ func TestRefreshStoresCapabilities(t *testing.T) {
 	}
 	if caps, ok := c.Capabilities("gpt-5.6-sol"); !ok || caps.MaxInputTokens != 272_000 || caps.MaxOutputTokens != 128_000 {
 		t.Errorf("capabilities = %+v, %v; want 272000/128000, true", caps, ok)
+	}
+	if got := string(c.AdditionalModelRequestFieldsSchema("gpt-5.6-sol")); got != `{"properties":{"reasoning":{}}}` {
+		t.Fatalf("request schema = %q", got)
+	}
+	copy := c.AdditionalModelRequestFieldsSchema("gpt-5.6-sol")
+	copy[0] = 'X'
+	if got := string(c.AdditionalModelRequestFieldsSchema("gpt-5.6-sol")); got[0] != '{' {
+		t.Fatal("request schema accessor exposed cache storage")
 	}
 	// Reported no limits → miss, not a zero-valued hit.
 	if caps, ok := c.Capabilities("mystery-model"); ok {
@@ -101,5 +109,21 @@ func TestRefreshFailureKeepsCatalog(t *testing.T) {
 	}
 	if err := c.Refresh(context.Background(), nil); err == nil {
 		t.Error("a nil fetch must be rejected")
+	}
+}
+
+func TestRecordSuccessfulModelAddsUnknownWithoutCapabilities(t *testing.T) {
+	cache := New([]string{"claude-opus-5"}, time.Hour, slog.New(slog.DiscardHandler))
+	if added := cache.RecordSuccessfulModel("claude-opus-5.5"); !added {
+		t.Fatal("successful unknown model was not added")
+	}
+	if !cache.IsValidModel("claude-opus-5.5") {
+		t.Fatal("recorded model is not valid")
+	}
+	if _, ok := cache.Capabilities("claude-opus-5.5"); ok {
+		t.Fatal("successful-use discovery invented capabilities")
+	}
+	if added := cache.RecordSuccessfulModel("claude-opus-5.5"); added {
+		t.Fatal("duplicate successful model reported as newly added")
 	}
 }

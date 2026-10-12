@@ -55,6 +55,51 @@ func processToolsWithLongDescriptions(tools []Tool, maxLen int) ([]Tool, string)
 	return processed, doc
 }
 
+func applyToolChoice(tools []Tool, choice ToolChoice) ([]Tool, string) {
+	if len(tools) == 0 {
+		return nil, ""
+	}
+	var instruction string
+	switch choice.Type {
+	case "none":
+		return nil, ""
+	case "tool", "function":
+		selected := make([]Tool, 0, 1)
+		for _, tool := range tools {
+			if tool.Name == choice.Name {
+				selected = append(selected, tool)
+				break
+			}
+		}
+		if len(selected) == 0 {
+			return nil, ""
+		}
+		instruction = fmt.Sprintf("\n\nYou MUST use the `%s` tool for this response.", choice.Name)
+		tools = selected
+	case "any":
+		instruction = "\n\nYou MUST use one of the available tools for this response."
+	}
+	if choice.DisableParallelUse {
+		instruction += " Call at most one tool in this response."
+	}
+	return tools, instruction
+}
+
+// SelectedToolNames returns the exact tool names Kiro sees after tool-choice
+// filtering and deterministic length aliasing. Stream fallback parsing uses this
+// as its allow-list; a text-emitted call can never invoke an unadvertised tool.
+func SelectedToolNames(tools []Tool, choice ToolChoice) []string {
+	selected, _ := applyToolChoice(tools, choice)
+	if len(selected) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(selected))
+	for _, tool := range selected {
+		names = append(names, ShortenToolName(tool.Name))
+	}
+	return names
+}
+
 // convertToolsToKiroFormat converts unified tools into Kiro toolSpecification
 // entries, sanitizing each input schema and substituting a placeholder for empty
 // descriptions.
@@ -151,9 +196,13 @@ func convertToolResultsToKiroFormat(results []ToolResult) []any {
 		if text == "" {
 			text = "(empty result)"
 		}
+		status := "success"
+		if tr.IsError {
+			status = "error"
+		}
 		out = append(out, map[string]any{
 			"content":   []any{map[string]any{"text": text}},
-			"status":    "success",
+			"status":    status,
 			"toolUseId": SanitizeToolUseID(tr.ToolUseID),
 		})
 	}
@@ -247,10 +296,14 @@ func toolResultsToText(results []ToolResult) string {
 		if text == "" {
 			text = "(empty result)"
 		}
+		prefix := "[Tool Result"
+		if tr.IsError {
+			prefix = "[Tool Error"
+		}
 		if tr.ToolUseID != "" {
-			parts = append(parts, fmt.Sprintf("[Tool Result (%s)]\n%s", tr.ToolUseID, text))
+			parts = append(parts, fmt.Sprintf("%s (%s)]\n%s", prefix, tr.ToolUseID, text))
 		} else {
-			parts = append(parts, fmt.Sprintf("[Tool Result]\n%s", text))
+			parts = append(parts, fmt.Sprintf("%s]\n%s", prefix, text))
 		}
 	}
 	return strings.Join(parts, "\n\n")

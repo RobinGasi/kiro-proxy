@@ -6,6 +6,7 @@
 package model
 
 import (
+	"encoding/json"
 	"regexp"
 	"sort"
 	"strconv"
@@ -16,10 +17,12 @@ import (
 type Cache interface {
 	IsValidModel(normalized string) bool
 	GetAllModelIDs() []string
-	// Capabilities returns the token limits Kiro reported for normalized on the
-	// last successful refresh, or ok=false when the model is unknown or the
-	// catalog carried no limits for it.
+	// Capabilities returns the token limits Kiro reported for normalized.
 	Capabilities(normalized string) (Capabilities, bool)
+}
+
+type requestSchemaCache interface {
+	AdditionalModelRequestFieldsSchema(normalized string) []byte
 }
 
 var (
@@ -50,11 +53,12 @@ type Capabilities struct {
 	MaxOutputTokens int
 }
 
-// CatalogModel is one entry of Kiro's model catalog: the model id plus whatever
-// token limits the catalog reported for it.
+// CatalogModel is one entry of Kiro's model catalog.
 type CatalogModel struct {
 	ID           string
 	Capabilities Capabilities
+	// AdditionalModelRequestFieldsSchema describes model-native reasoning fields.
+	AdditionalModelRequestFieldsSchema json.RawMessage
 }
 
 // knownCapabilities is the offline fallback for model token limits, keyed by
@@ -275,6 +279,20 @@ func (r *Resolver) Capabilities(modelID string) (Capabilities, bool) {
 		}
 	}
 	return CapabilitiesFor(id)
+}
+
+// AdditionalModelRequestFieldsSchema returns a copy of Kiro's request-field
+// schema for modelID, if the live catalog supplied one.
+func (r *Resolver) AdditionalModelRequestFieldsSchema(modelID string) json.RawMessage {
+	if r == nil || r.cache == nil {
+		return nil
+	}
+	c, ok := r.cache.(requestSchemaCache)
+	if !ok {
+		return nil
+	}
+	id := r.Resolve(modelID).InternalID
+	return c.AdditionalModelRequestFieldsSchema(id)
 }
 
 // ContextLimitFor returns the input-context window for modelID, falling back to

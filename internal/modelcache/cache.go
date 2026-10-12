@@ -15,6 +15,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,11 +31,13 @@ var _ model.Cache = (*ModelInfoCache)(nil)
 // periodic calls to Refresh. The zero value is not usable; construct one with
 // New.
 type ModelInfoCache struct {
-	mu         sync.RWMutex
-	models     []string                      // ordered, de-duplicated list of model IDs
-	valid      map[string]struct{}           // set view of models for O(1) lookup
-	caps       map[string]model.Capabilities // token limits, only for models that reported them
-	lastUpdate time.Time                     // zero until the first successful Refresh
+	mu      sync.RWMutex
+	models  []string
+	valid   map[string]struct{}
+	caps    map[string]model.Capabilities
+	schemas map[string][]byte
+
+	lastUpdate time.Time
 	ttl        time.Duration
 	logger     *slog.Logger
 }
@@ -59,13 +62,14 @@ func New(fallback []string, ttl time.Duration, logger *slog.Logger) *ModelInfoCa
 	for _, id := range fallback {
 		entries = append(entries, model.CatalogModel{ID: id})
 	}
-	models, valid, caps := index(entries)
+	models, valid, caps, schemas := index(entries)
 	return &ModelInfoCache{
-		models: models,
-		valid:  valid,
-		caps:   caps,
-		ttl:    ttl,
-		logger: logger,
+		models:  models,
+		valid:   valid,
+		caps:    caps,
+		schemas: schemas,
+		ttl:     ttl,
+		logger:  logger,
 	}
 }
 
@@ -87,7 +91,7 @@ func (c *ModelInfoCache) Refresh(ctx context.Context, fetch func(context.Context
 		// (or fallback) contents are kept either way.
 		return err
 	}
-	models, valid, caps := index(entries)
+	models, valid, caps, schemas := index(entries)
 	if len(models) == 0 {
 		c.logger.Debug("model cache refresh returned no models; keeping existing contents")
 		return nil
@@ -97,6 +101,7 @@ func (c *ModelInfoCache) Refresh(ctx context.Context, fetch func(context.Context
 	c.models = models
 	c.valid = valid
 	c.caps = caps
+	c.schemas = schemas
 	c.lastUpdate = time.Now()
 	c.mu.Unlock()
 
@@ -129,6 +134,17 @@ func (c *ModelInfoCache) Capabilities(normalized string) (model.Capabilities, bo
 	return caps, ok
 }
 
+// AdditionalModelRequestFieldsSchema returns a defensive copy of the schema
+// advertised by Kiro for normalized.
+func (c *ModelInfoCache) AdditionalModelRequestFieldsSchema(normalized string) []byte {
+	if normalized == "" {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return append([]byte(nil), c.schemas[normalized]...)
+}
+
 // GetAllModelIDs returns a copy of all cached model IDs. It implements
 // model.Cache.
 func (c *ModelInfoCache) GetAllModelIDs() []string {
@@ -143,6 +159,25 @@ func (c *ModelInfoCache) GetAllModels() []string {
 	out := make([]string, len(c.models))
 	copy(out, c.models)
 	return out
+}
+
+// RecordSuccessfulModel appends an unknown exact model ID after Kiro has served
+// it successfully. It never invents capabilities or request schema. The return
+// value reports whether the cache changed.
+func (c *ModelInfoCache) RecordSuccessfulModel(id string) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, exists := c.valid[id]; exists {
+		return false
+	}
+	c.models = append(c.models, id)
+	c.valid[id] = struct{}{}
+	c.logger.Info("recorded successfully served model", "model", id)
+	return true
 }
 
 // NeedsRefresh reports whether the cache has never been refreshed or its TTL has
@@ -167,10 +202,11 @@ func (c *ModelInfoCache) Size() int {
 // empty IDs and duplicates dropped, first occurrence winning), its set view, and
 // the capability map — which only holds entries that actually reported a limit,
 // so a miss is distinguishable from a reported zero.
-func index(entries []model.CatalogModel) ([]string, map[string]struct{}, map[string]model.Capabilities) {
+func index(entries []model.CatalogModel) ([]string, map[string]struct{}, map[string]model.Capabilities, map[string][]byte) {
 	ids := make([]string, 0, len(entries))
 	valid := make(map[string]struct{}, len(entries))
 	caps := make(map[string]model.Capabilities, len(entries))
+	schemas := make(map[string][]byte, len(entries))
 	for _, e := range entries {
 		if e.ID == "" {
 			continue
@@ -183,6 +219,9 @@ func index(entries []model.CatalogModel) ([]string, map[string]struct{}, map[str
 		if e.Capabilities.MaxInputTokens > 0 || e.Capabilities.MaxOutputTokens > 0 {
 			caps[e.ID] = e.Capabilities
 		}
+		if len(e.AdditionalModelRequestFieldsSchema) > 0 {
+			schemas[e.ID] = append([]byte(nil), e.AdditionalModelRequestFieldsSchema...)
+		}
 	}
-	return ids, valid, caps
+	return ids, valid, caps, schemas
 }
