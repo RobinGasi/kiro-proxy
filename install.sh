@@ -2,7 +2,7 @@
 #
 # kiro-proxy installer — one-command setup.
 #
-#   gh api repos/RobinGasi/kiro-proxy/contents/install.sh -H 'Accept: application/vnd.github.raw' | bash
+#   curl -fsSL https://raw.githubusercontent.com/RobinGasi/kiro-proxy/main/install.sh | bash
 #
 # What it does:
 #   1. Detects your Kiro credentials and how you log in — AWS IAM Identity Center
@@ -413,19 +413,13 @@ clone_source() {
     return 0
   fi
   rm -rf "$dest"
-  # Private repo: prefer gh (uses its stored GitHub login); plain git relies on
-  # your credential helper.
-  if have gh; then
-    gh repo clone "$REPO" "$dest" -- --depth 1 --branch "$REF" >/dev/null 2>&1
-  else
-    git clone --depth 1 --branch "$REF" "https://github.com/$REPO.git" "$dest" >/dev/null 2>&1
-  fi
+  git clone --depth 1 --branch "$REF" "https://github.com/$REPO.git" "$dest" >/dev/null 2>&1
 }
 
 install_source() {
   have go || { warn "Go toolchain not found; can't build from source."; return 1; }
   log "Building from source ($REPO@$REF)…"
-  clone_source || { warn "Clone failed (private repo? run 'gh auth login' first)."; return 1; }
+  clone_source || { warn "Clone of https://github.com/$REPO failed."; return 1; }
   ( cd "$DIR/src" && CGO_ENABLED=0 go build -trimpath -o "$DIR/kiro-proxy" ./cmd/kiro-proxy ) \
     || { warn "go build failed."; return 1; }
   ok "Built $DIR/kiro-proxy"
@@ -517,11 +511,11 @@ main() {
 
   RUN_METHOD=""
   case "$METHOD" in
-    docker) install_docker || die "Docker install failed. Try --method source, or fix Docker/GHCR access." ;;
-    source) install_source || die "Source build failed. Install Go and 'gh', or use --method docker." ;;
+    docker) install_docker || die "Docker install failed. Try --method source, or check that Docker can reach ghcr.io." ;;
+    source) install_source || die "Source build failed. Install Go and git, or use --method docker." ;;
     auto)
       install_docker || install_source || die "No install method worked.
-Need either a running Docker (with access to $IMAGE) or a Go toolchain + git/gh.
+Need either a running Docker (able to pull $IMAGE) or a Go toolchain + git.
 Install one and re-run, or pass --method explicitly." ;;
     *) die "unknown --method: $METHOD (use auto|docker|source)" ;;
   esac

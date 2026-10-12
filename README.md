@@ -40,12 +40,8 @@ installs the proxy (**Docker** or **built from source**, auto-chosen), starts it
 and prints how to point Claude Code / Codex at it.
 
 ```bash
-gh api repos/RobinGasi/kiro-proxy/contents/install.sh -H 'Accept: application/vnd.github.raw' | bash
+curl -fsSL https://raw.githubusercontent.com/RobinGasi/kiro-proxy/main/install.sh | bash
 ```
-
-The repo is private, so this uses your `gh` login. The image it pulls,
-`ghcr.io/robingasi/kiro-proxy`, is public; without repo access, follow the
-[public install notes](https://gist.github.com/RobinGasi/c6ee980e39d169fe34b7786d6ef68822).
 
 If no credentials are found and `kiro-cli` is installed, the installer offers to
 run `kiro-cli login` first (Builder ID / IdC-SSO / social). Pass flags after
