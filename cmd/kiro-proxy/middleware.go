@@ -36,6 +36,8 @@ func requestLogger(next http.Handler, log *slog.Logger, dbg *debuglog.Logger) ht
 			return
 		}
 		reqID := util.UUIDHex()[:8]
+		w.Header().Set("request-id", reqID)
+		w.Header().Set("x-request-id", reqID)
 		log.Info("request start",
 			"req_id", reqID,
 			"method", r.Method,
