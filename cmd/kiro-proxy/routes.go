@@ -32,7 +32,7 @@ type deps struct {
 // A failure to initialize accounts is logged but not fatal: the server still
 // serves /health, and request routes return 503 until credentials are valid.
 func buildDeps(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*deps, error) {
-	hc, err := transport.New(cfg.VPNProxyURL)
+	hc, err := transport.New(cfg)
 	if err != nil {
 		return nil, err
 	}

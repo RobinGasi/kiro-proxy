@@ -12,13 +12,23 @@ import (
 	"time"
 
 	"golang.org/x/net/proxy"
+
+	"git.gasi.dev/robin/kiro-proxy/internal/config"
 )
 
-// New builds an *http.Client with a tuned Transport. proxyURL may be empty
-// (direct), an http(s):// URL, a socks5:// URL, or a bare host:port (treated as
-// http://). There is intentionally NO Client.Timeout — SSE streams are
-// long-lived; callers apply per-request context deadlines instead.
-func New(proxyURL string) (*http.Client, error) {
+// New builds an *http.Client with a tuned Transport. VPNProxyURL may be empty
+// (direct), an http(s):// URL, a socks5:// URL, or a bare host:port. There is no
+// Client.Timeout because SSE streams are long-lived; ResponseHeaderTimeout caps
+// the otherwise-unbounded wait before an upstream response starts.
+func New(cfg *config.Config) (*http.Client, error) {
+	proxyURL := ""
+	headerTimeout := 60 * time.Second
+	if cfg != nil {
+		proxyURL = cfg.VPNProxyURL
+		if cfg.UpstreamResponseHeaderTimeout > 0 {
+			headerTimeout = time.Duration(cfg.UpstreamResponseHeaderTimeout * float64(time.Second))
+		}
+	}
 	tr := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
@@ -29,6 +39,7 @@ func New(proxyURL string) (*http.Client, error) {
 		MaxIdleConnsPerHost:   20,
 		IdleConnTimeout:       30 * time.Second,
 		TLSHandshakeTimeout:   30 * time.Second,
+		ResponseHeaderTimeout: headerTimeout,
 		ExpectContinueTimeout: 1 * time.Second,
 		ForceAttemptHTTP2:     true,
 	}

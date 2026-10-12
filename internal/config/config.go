@@ -132,6 +132,8 @@ type Config struct {
 	// Streaming timeouts.
 	FirstTokenTimeout               float64
 	StreamingReadTimeout            float64
+	UpstreamResponseHeaderTimeout   float64
+	AnthropicPingInterval           float64
 	FirstTokenMaxRetries            int
 	ModelRestrictionCooldownSeconds int
 
@@ -211,6 +213,8 @@ func Load() *Config {
 
 		FirstTokenTimeout:               getEnvFloat("FIRST_TOKEN_TIMEOUT", 15),
 		StreamingReadTimeout:            getEnvFloat("STREAMING_READ_TIMEOUT", 300),
+		UpstreamResponseHeaderTimeout:   getEnvFloat("UPSTREAM_RESPONSE_HEADER_TIMEOUT", 60),
+		AnthropicPingInterval:           getEnvFloat("ANTHROPIC_PING_INTERVAL", 10),
 		FirstTokenMaxRetries:            getEnvInt("FIRST_TOKEN_MAX_RETRIES", 3),
 		ModelRestrictionCooldownSeconds: getEnvInt("MODEL_RESTRICTION_COOLDOWN_SECONDS", 3600),
 
