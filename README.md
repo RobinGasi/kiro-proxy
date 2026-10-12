@@ -13,16 +13,16 @@ is handed off to a second agent, so the full omp toolchain stays in play on ever
 ## Install
 
 ```sh
-omp plugin install git+https://git.gasi.dev/robin/omp-kiro.git
+omp plugin install github:RobinGasi/omp-kiro
 ```
 
-The `git+` prefix matters: without it `bun install` treats the URL as a tarball and fails. The repo is
-public, so no credentials are needed.
+The [kiro-proxy installer](https://github.com/RobinGasi/kiro-proxy#one-command-install-recommended)
+runs this for you when `omp` is on your `PATH`.
 
 Developing on it instead? Clone and link, so edits in the working tree are live:
 
 ```sh
-git clone https://git.gasi.dev/robin/omp-kiro.git
+git clone https://github.com/RobinGasi/omp-kiro.git
 omp plugin uninstall omp-kiro   # only if a copy is already installed — link cannot replace it
 omp plugin link ./omp-kiro
 ```
@@ -101,7 +101,8 @@ Environment variables, or `~/.omp/agent/.env` (profile-aware — the host's own 
 | `KIRO_PROXY_URL`     | `http://127.0.0.1:8442`                    | Proxy base; `/v1` is appended    |
 | `KIRO_PROXY_API_KEY` | `PROXY_API_KEY`, then `~/.kiro-proxy/.env` | Bearer token                     |
 
-Requires `kiro-proxy` to be running (`~/.kiro-proxy/start.sh`).
+Requires [`kiro-proxy`](https://github.com/RobinGasi/kiro-proxy) to be running (Docker container `kiro-proxy`, or
+`~/.kiro-proxy/start.sh` for a source install).
 
 The key is handed to omp as an **env var name**, not as the secret. omp resolves `apiKey` through its shared config
 resolver (`!cmd` runs a shell command, otherwise env lookup, otherwise literal), so passing a name means a key that
