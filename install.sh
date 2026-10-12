@@ -16,7 +16,9 @@
 #   4. Health-checks it and prints how to point Claude Code / Codex at it.
 #
 # If no credentials are found and `kiro-cli` is installed, it offers to run
-# `kiro-cli login` and (best-effort) to ask the kiro-cli AI for help.
+# `kiro-cli login` and (best-effort) to ask the kiro-cli AI for help. When `omp`
+# (oh-my-pi) is installed, it also installs the omp-kiro plugin so Kiro models
+# show up in omp.
 #
 # Everything is overridable via flags or env vars — run with --help.
 #
@@ -35,6 +37,8 @@ METHOD="${KIRO_PROXY_METHOD:-auto}"     # auto | docker | source
 ASSUME_YES=0
 ASSIST=0
 NO_START=0
+OMP_PLUGIN="${KIRO_PROXY_OMP:-1}"        # 1 = install the omp-kiro plugin when omp exists
+OMP_PLUGIN_SPEC="github:RobinGasi/omp-kiro"
 REFRESH_TOKEN="${REFRESH_TOKEN:-}"
 PROFILE_ARN="${PROFILE_ARN:-}"
 
@@ -97,11 +101,12 @@ Options:
   --assist              If setup gets stuck, ask the kiro-cli AI for help
   -y, --yes             Non-interactive; accept all defaults
   --no-start            Configure and install, but don't start the proxy
+  --no-omp              Skip installing the omp-kiro plugin for omp
   -h, --help            Show this help
 
 Env var overrides: KIRO_PROXY_DIR, KIRO_PROXY_PORT, KIRO_REGION,
 KIRO_PROXY_METHOD, KIRO_PROXY_REPO, KIRO_PROXY_REF, KIRO_PROXY_REGISTRY,
-REFRESH_TOKEN, PROFILE_ARN.
+KIRO_PROXY_OMP (0 = skip omp plugin), REFRESH_TOKEN, PROFILE_ARN.
 EOF
 }
 
@@ -121,6 +126,7 @@ while [ $# -gt 0 ]; do
     --assist) ASSIST=1; shift ;;
     -y|--yes) ASSUME_YES=1; shift ;;
     --no-start) NO_START=1; shift ;;
+    --no-omp) OMP_PLUGIN=0; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1 (try --help)" ;;
   esac
@@ -460,6 +466,49 @@ wait_health() {
   return 1
 }
 
+# ---------------------------------------------------------------------------
+# omp (oh-my-pi) integration: the omp-kiro plugin registers a `kiro` provider
+# backed by this proxy. It reads PROXY_API_KEY from ~/.kiro-proxy/.env and
+# defaults to http://127.0.0.1:8442, so only a non-default port or dir needs
+# extra config in omp's agent .env.
+# ---------------------------------------------------------------------------
+OMP_STATUS=""
+
+# Set KEY=VALUE in a dotenv file, replacing an existing KEY line.
+upsert_env() {
+  local file="$1" key="$2" value="$3" tmp
+  mkdir -p "$(dirname "$file")"
+  touch "$file"
+  tmp="$(mktemp)"
+  grep -v "^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}$key=" "$file" > "$tmp" || true
+  printf '%s=%s\n' "$key" "$value" >> "$tmp"
+  cat "$tmp" > "$file"
+  rm -f "$tmp"
+}
+
+install_omp_plugin() {
+  [ "$OMP_PLUGIN" = 1 ] || return 0
+  have omp || return 0
+  log "omp found — installing the omp-kiro plugin ($OMP_PLUGIN_SPEC)…"
+  if ! omp plugin install "$OMP_PLUGIN_SPEC" >/dev/null 2>&1; then
+    warn "omp plugin install failed. Retry with: omp plugin install $OMP_PLUGIN_SPEC"
+    OMP_STATUS="failed"
+    return 0
+  fi
+
+  local agent_env="${PI_CODING_AGENT_DIR:-$HOME/.omp/agent}/.env"
+  if [ "$PORT" != 8442 ]; then
+    upsert_env "$agent_env" KIRO_PROXY_URL "http://127.0.0.1:$PORT"
+  fi
+  if [ "$DIR" != "$HOME/.kiro-proxy" ]; then
+    # The plugin only auto-reads ~/.kiro-proxy/.env; hand it the key directly.
+    upsert_env "$agent_env" KIRO_PROXY_API_KEY "$PROXY_API_KEY"
+    chmod 600 "$agent_env" 2>/dev/null || true
+  fi
+  OMP_STATUS="installed"
+  ok "omp-kiro installed. Restart omp, then pick a kiro/… model (omp models)."
+}
+
 summary() {
   printf '\n%s%s kiro-proxy is set up %s\n' "$C_GREEN$C_BOLD" "──" "$C_RESET"
   printf '  %sBase URL%s  http://localhost:%s\n' "$C_DIM" "$C_RESET" "$PORT"
@@ -492,6 +541,19 @@ ${C_BOLD}Codex CLI${C_RESET} (OpenAI-compatible): add a provider with
   base_url = "http://localhost:$PORT/v1"  and  env_key = "PROXY_API_KEY"
   (see README → "Using with coding agents").
 EOF
+
+  if [ "$OMP_STATUS" = installed ]; then
+    cat <<EOF
+
+${C_BOLD}omp${C_RESET} (oh-my-pi): omp-kiro plugin installed. Restart omp, then:
+  omp --model kiro/claude-opus-5 "…"
+EOF
+  else
+    cat <<EOF
+
+${C_BOLD}omp${C_RESET} (oh-my-pi): omp plugin install $OMP_PLUGIN_SPEC
+EOF
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -502,9 +564,9 @@ main() {
 
   resolve_credentials
   write_env
-
   if [ "$NO_START" = 1 ]; then
     ok "Configured. Skipping install/start (--no-start)."
+    install_omp_plugin
     summary
     return
   fi
@@ -532,6 +594,7 @@ Install one and re-run, or pass --method explicitly." ;;
     fi
   fi
 
+  install_omp_plugin
   summary
 }
 
