@@ -38,8 +38,10 @@ Identity Center / Builder ID / social login (via the kiro-cli database), a Kiro
 IDE credentials file, or a raw refresh token — writes `~/.kiro-proxy/.env`,
 installs the proxy (**Docker** or **built from source**, auto-chosen), starts it,
 and prints how to point Claude Code / Codex at it. If [omp](https://github.com/can1357/oh-my-pi)
-is installed, it also installs the [omp-kiro](https://github.com/RobinGasi/omp-kiro)
-plugin, so Kiro models show up in omp as `kiro/…`.
+is installed, it also sets up the bundled [omp-kiro](./omp-kiro) plugin, so Kiro
+models show up in omp as `kiro/…`. Re-running it is safe: unchanged settings,
+containers, binaries and plugin state are left alone, and settings you add to
+`~/.kiro-proxy/.env` are kept.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/RobinGasi/kiro-proxy/main/install.sh | bash
@@ -57,7 +59,7 @@ run `kiro-cli login` first (Builder ID / IdC-SSO / social). Pass flags after
 | `--assist` | If setup stalls, ask the kiro-cli AI for help |
 | `-y`, `--yes` | Non-interactive; accept defaults |
 | `--no-start` | Configure only; don't start |
-| `--no-omp` | Don't install the omp-kiro plugin |
+| `--no-omp` | Don't set up the omp-kiro plugin |
 | `--help` | Full list of flags and env-var overrides |
 
 The proxy lands in `~/.kiro-proxy` (config, logs, and `start.sh`/`stop.sh` for
@@ -155,12 +157,12 @@ codex
 
 ### omp (oh-my-pi)
 
-The [omp-kiro](https://github.com/RobinGasi/omp-kiro) plugin registers a `kiro`
-provider backed by this proxy (the installer adds it automatically when `omp` is
-present):
+The [omp-kiro](./omp-kiro) plugin in this repo registers a `kiro` provider
+backed by this proxy. The installer links it automatically when `omp` is
+present (into `~/.kiro-proxy/omp-kiro`); to do it by hand from a clone:
 
 ```bash
-omp plugin install github:RobinGasi/omp-kiro
+omp plugin link ./omp-kiro
 omp --model kiro/claude-opus-5 "…"
 ```
 
