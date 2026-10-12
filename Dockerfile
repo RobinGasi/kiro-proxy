@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1
 
 # --- build stage ---
-FROM golang:1.26 AS build
+# Build on the native runner arch and cross-compile for the target (no QEMU).
+FROM --platform=$BUILDPLATFORM golang:1.26 AS build
 WORKDIR /src
 
 # Cache modules first.
@@ -11,9 +12,11 @@ RUN go mod download || true
 COPY . .
 
 ARG VERSION=0.0.0-dev
+ARG TARGETOS
+ARG TARGETARCH
 # CGO disabled -> fully static binary (modernc.org/sqlite is pure Go).
 ENV CGO_ENABLED=0
-RUN go build -trimpath \
+RUN GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath \
     -ldflags="-s -w -X git.gasi.dev/robin/kiro-proxy/internal/config.AppVersion=${VERSION}" \
     -o /out/kiro-proxy ./cmd/kiro-proxy
 

@@ -208,6 +208,11 @@ analyzes the Conventional Commits and computes + tags the next version, then
 the Gitea Release (with notes and checksums), and publishes the multi-arch image
 to `git.gasi.dev/robin/kiro-proxy`.
 
+The GitHub mirror runs [`ghcr.yml`](.github/workflows/ghcr.yml) instead, publishing
+the multi-arch image to `ghcr.io/robingasi/kiro-proxy` (`latest`, `sha-*`, and
+semver tags). Public install notes:
+<https://gist.github.com/RobinGasi/c6ee980e39d169fe34b7786d6ef68822>.
+
 ## License
 
 GNU AGPL-3.0 — see [`LICENSE`](./LICENSE). Running a modified version as a network

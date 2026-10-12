@@ -28,6 +28,8 @@ jobs:
       - run: go test ./...
 
   release:
+    # Gitea/Forgejo only; the GitHub mirror publishes via ghcr.yml instead.
+    if: github.server_url != 'https://github.com'
     needs: test
     runs-on: ubuntu-latest
     steps:
