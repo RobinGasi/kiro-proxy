@@ -442,8 +442,11 @@ install_docker() {
   # "Library/Application Support/…") survive intact.
   # Map host:container to the same port and let the app bind $PORT inside (via
   # SERVER_PORT in the env-file), so any --port works — not just the default.
+  # The named volume keeps account state (model cooldowns, failure counts)
+  # across container recreation; the image ships /state owned by nonroot.
   local args=(-d --name kiro-proxy --restart unless-stopped
-    -p "$PORT:$PORT" --env-file "$ENV_FILE")
+    -p "$PORT:$PORT" --env-file "$ENV_FILE"
+    -v kiro-proxy-state:/state -e ACCOUNTS_STATE_FILE=/state/state.json)
 
   # Mount a local credential file (SQLite/JSON) read-only and point the proxy at it.
   if [ "$CRED_KIND" = "sqlite" ] || [ "$CRED_KIND" = "creds_file" ]; then

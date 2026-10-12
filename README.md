@@ -79,7 +79,9 @@ go build -o kiro-proxy ./cmd/kiro-proxy && ./kiro-proxy
 ```bash
 docker compose up -d
 # or:
-docker run -p 8442:8442 --env-file .env ghcr.io/robingasi/kiro-proxy:latest
+docker run -p 8442:8442 --env-file .env \
+  -v kiro-proxy-state:/state -e ACCOUNTS_STATE_FILE=/state/state.json \
+  ghcr.io/robingasi/kiro-proxy:latest
 ```
 
 ## Authentication

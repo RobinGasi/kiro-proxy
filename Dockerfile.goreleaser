@@ -4,10 +4,18 @@
 #
 # Kept separate from the top-level Dockerfile, which builds from source for local
 # `docker build` and docker-compose use.
+
+# /state is where the installer mounts its named volume for the account state
+# file. Docker seeds a new named volume from the image's directory, ownership
+# included, so it must exist here owned by nonroot or the proxy cannot write it.
+FROM --platform=$BUILDPLATFORM busybox:stable AS dirs
+RUN mkdir /state
+
 FROM gcr.io/distroless/static-debian12:nonroot
 ARG TARGETPLATFORM
 WORKDIR /app
 COPY ${TARGETPLATFORM}/kiro-proxy /app/kiro-proxy
+COPY --from=dirs --chown=nonroot:nonroot /state /state
 EXPOSE 8442
 USER nonroot:nonroot
 ENTRYPOINT ["/app/kiro-proxy"]
