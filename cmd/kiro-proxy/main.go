@@ -56,9 +56,16 @@ func main() {
 		slog.Error("startup failed", "err", err)
 		os.Exit(1)
 	}
-	if d.accounts != nil {
-		go d.accounts.StartStatePersistence(ctx)
-	}
+	// Persistence outlives the signal: it stops only after in-flight requests
+	// drain, and main waits for its final save before exiting.
+	persistCtx, stopPersist := context.WithCancel(context.Background())
+	persisted := make(chan struct{})
+	go func() {
+		defer close(persisted)
+		if d.accounts != nil {
+			d.accounts.StartStatePersistence(persistCtx)
+		}
+	}()
 
 	mux := http.NewServeMux()
 	d.registerRoutes(mux)
@@ -91,6 +98,8 @@ func main() {
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			slog.Error("graceful shutdown failed", "err", err)
 		}
+		stopPersist()
+		<-persisted
 	}
 }
 
