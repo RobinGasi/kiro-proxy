@@ -9,13 +9,13 @@ import (
 	"strings"
 	"time"
 
-	"git.gasi.dev/robin/kiro-proxy/internal/awsstream"
-	"git.gasi.dev/robin/kiro-proxy/internal/converter"
-	"git.gasi.dev/robin/kiro-proxy/internal/mcp"
-	"git.gasi.dev/robin/kiro-proxy/internal/streaming"
-	"git.gasi.dev/robin/kiro-proxy/internal/thinking"
-	"git.gasi.dev/robin/kiro-proxy/internal/usage"
-	"git.gasi.dev/robin/kiro-proxy/internal/util"
+	"github.com/RobinGasi/kiro-proxy/internal/awsstream"
+	"github.com/RobinGasi/kiro-proxy/internal/converter"
+	"github.com/RobinGasi/kiro-proxy/internal/mcp"
+	"github.com/RobinGasi/kiro-proxy/internal/streaming"
+	"github.com/RobinGasi/kiro-proxy/internal/thinking"
+	"github.com/RobinGasi/kiro-proxy/internal/usage"
+	"github.com/RobinGasi/kiro-proxy/internal/util"
 )
 
 const (

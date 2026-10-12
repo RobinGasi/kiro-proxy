@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"time"
 
-	"git.gasi.dev/robin/kiro-proxy/internal/debuglog"
-	"git.gasi.dev/robin/kiro-proxy/internal/util"
+	"github.com/RobinGasi/kiro-proxy/internal/debuglog"
+	"github.com/RobinGasi/kiro-proxy/internal/util"
 )
 
 // errMsgCaptureBytes caps how much of a failed response body is copied into

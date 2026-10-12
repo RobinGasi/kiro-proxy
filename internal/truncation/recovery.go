@@ -12,7 +12,7 @@ package truncation
 import (
 	"log/slog"
 
-	"git.gasi.dev/robin/kiro-proxy/internal/config"
+	"github.com/RobinGasi/kiro-proxy/internal/config"
 )
 
 // TruncationInfo holds diagnostic information about a single truncation event,

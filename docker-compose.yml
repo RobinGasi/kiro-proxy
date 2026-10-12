@@ -1,6 +1,6 @@
 services:
   kiro-proxy:
-    image: git.gasi.dev/robin/kiro-proxy:latest
+    image: ghcr.io/robingasi/kiro-proxy:latest
     # To build locally instead of pulling, comment out `image:` above and use:
     # build: .
     container_name: kiro-proxy

@@ -7,7 +7,7 @@ import (
 	"log/slog"
 	"strings"
 
-	"git.gasi.dev/robin/kiro-proxy/internal/converter"
+	"github.com/RobinGasi/kiro-proxy/internal/converter"
 )
 
 var errUnsupportedContent = errors.New("unsupported Anthropic content block")

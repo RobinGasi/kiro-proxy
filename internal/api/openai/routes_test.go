@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"git.gasi.dev/robin/kiro-proxy/internal/account"
-	"git.gasi.dev/robin/kiro-proxy/internal/model"
+	"github.com/RobinGasi/kiro-proxy/internal/account"
+	"github.com/RobinGasi/kiro-proxy/internal/model"
 	"time"
 )
 

@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"git.gasi.dev/robin/kiro-proxy/internal/config"
+	"github.com/RobinGasi/kiro-proxy/internal/config"
 )
 
 func TestBuildKiroPayloadPreservesFailedToolResult(t *testing.T) {

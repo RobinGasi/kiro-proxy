@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"git.gasi.dev/robin/kiro-proxy/internal/config"
+	"github.com/RobinGasi/kiro-proxy/internal/config"
 )
 
 func TestNewAppliesResponseHeaderTimeout(t *testing.T) {

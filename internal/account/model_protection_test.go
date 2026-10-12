@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"git.gasi.dev/robin/kiro-proxy/internal/config"
+	"github.com/RobinGasi/kiro-proxy/internal/config"
 )
 
 func TestModelProtectionPersistsAndDoesNotBlockOtherModels(t *testing.T) {

@@ -2,7 +2,7 @@
 #
 # kiro-proxy installer — one-command setup.
 #
-#   curl -fsSL https://git.gasi.dev/robin/kiro-proxy/raw/branch/main/install.sh | bash
+#   gh api repos/RobinGasi/kiro-proxy/contents/install.sh -H 'Accept: application/vnd.github.raw' | bash
 #
 # What it does:
 #   1. Detects your Kiro credentials and how you log in — AWS IAM Identity Center
@@ -25,8 +25,8 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Defaults (override with env vars or flags)
 # ---------------------------------------------------------------------------
-HOST="${KIRO_PROXY_HOST:-git.gasi.dev}"
-REPO="${KIRO_PROXY_REPO:-robin/kiro-proxy}"
+REGISTRY="${KIRO_PROXY_REGISTRY:-ghcr.io}"
+REPO="${KIRO_PROXY_REPO:-RobinGasi/kiro-proxy}"
 REF="${KIRO_PROXY_REF:-main}"
 DIR="${KIRO_PROXY_DIR:-$HOME/.kiro-proxy}"
 PORT="${KIRO_PROXY_PORT:-8442}"
@@ -100,7 +100,8 @@ Options:
   -h, --help            Show this help
 
 Env var overrides: KIRO_PROXY_DIR, KIRO_PROXY_PORT, KIRO_REGION,
-KIRO_PROXY_METHOD, KIRO_PROXY_REPO, KIRO_PROXY_REF, REFRESH_TOKEN, PROFILE_ARN.
+KIRO_PROXY_METHOD, KIRO_PROXY_REPO, KIRO_PROXY_REF, KIRO_PROXY_REGISTRY,
+REFRESH_TOKEN, PROFILE_ARN.
 EOF
 }
 
@@ -126,7 +127,7 @@ while [ $# -gt 0 ]; do
 done
 
 OWNER="$(lower "${REPO%%/*}")"
-IMAGE="$HOST/$OWNER/kiro-proxy:latest"
+IMAGE="$REGISTRY/$OWNER/kiro-proxy:latest"
 
 # ---------------------------------------------------------------------------
 # Platform
@@ -364,26 +365,11 @@ EOF
 # ---------------------------------------------------------------------------
 docker_available() { have docker && docker info >/dev/null 2>&1; }
 
-registry_login() {
-  # Private image on the Gitea container registry ($HOST). Authenticate with
-  # `docker login $HOST` beforehand, or set KIRO_PROXY_REGISTRY_TOKEN (and
-  # optionally KIRO_PROXY_REGISTRY_USER, default the repo owner). Best-effort;
-  # on failure the installer falls back to building from source.
-  have docker || return 0
-  local user token
-  user="${KIRO_PROXY_REGISTRY_USER:-$OWNER}"
-  token="${KIRO_PROXY_REGISTRY_TOKEN:-}"
-  [ -n "$token" ] || return 0
-  printf '%s' "$token" | docker login "$HOST" -u "$user" --password-stdin >/dev/null 2>&1 \
-    && ok "Logged in to $HOST as $user" || warn "$HOST login failed; pull may fail if the image is private."
-}
-
 install_docker() {
   docker_available || return 1
   log "Installing via Docker ($IMAGE)…"
-  registry_login
   if ! docker pull "$IMAGE" >/dev/null 2>&1; then
-    warn "Could not pull $IMAGE (private image not published yet, or not logged in)."
+    warn "Could not pull $IMAGE."
     return 1
   fi
 
@@ -427,15 +413,19 @@ clone_source() {
     return 0
   fi
   rm -rf "$dest"
-  # Private repo: git uses your credential helper (e.g. a stored $HOST token) to
-  # authenticate the clone.
-  git clone --depth 1 --branch "$REF" "https://$HOST/$REPO.git" "$dest" >/dev/null 2>&1
+  # Private repo: prefer gh (uses its stored GitHub login); plain git relies on
+  # your credential helper.
+  if have gh; then
+    gh repo clone "$REPO" "$dest" -- --depth 1 --branch "$REF" >/dev/null 2>&1
+  else
+    git clone --depth 1 --branch "$REF" "https://github.com/$REPO.git" "$dest" >/dev/null 2>&1
+  fi
 }
 
 install_source() {
   have go || { warn "Go toolchain not found; can't build from source."; return 1; }
   log "Building from source ($REPO@$REF)…"
-  clone_source || { warn "Clone failed (private repo? authenticate git for $HOST first)."; return 1; }
+  clone_source || { warn "Clone failed (private repo? run 'gh auth login' first)."; return 1; }
   ( cd "$DIR/src" && CGO_ENABLED=0 go build -trimpath -o "$DIR/kiro-proxy" ./cmd/kiro-proxy ) \
     || { warn "go build failed."; return 1; }
   ok "Built $DIR/kiro-proxy"

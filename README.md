@@ -40,8 +40,12 @@ installs the proxy (**Docker** or **built from source**, auto-chosen), starts it
 and prints how to point Claude Code / Codex at it.
 
 ```bash
-curl -fsSL https://git.gasi.dev/robin/kiro-proxy/raw/branch/main/install.sh | bash
+gh api repos/RobinGasi/kiro-proxy/contents/install.sh -H 'Accept: application/vnd.github.raw' | bash
 ```
+
+The repo is private, so this uses your `gh` login. The image it pulls,
+`ghcr.io/robingasi/kiro-proxy`, is public; without repo access, follow the
+[public install notes](https://gist.github.com/RobinGasi/c6ee980e39d169fe34b7786d6ef68822).
 
 If no credentials are found and `kiro-cli` is installed, the installer offers to
 run `kiro-cli login` first (Builder ID / IdC-SSO / social). Pass flags after
@@ -74,7 +78,7 @@ go build -o kiro-proxy ./cmd/kiro-proxy && ./kiro-proxy
 ```bash
 docker compose up -d
 # or:
-docker run -p 8442:8442 --env-file .env git.gasi.dev/robin/kiro-proxy:latest
+docker run -p 8442:8442 --env-file .env ghcr.io/robingasi/kiro-proxy:latest
 ```
 
 ## Authentication
@@ -205,12 +209,9 @@ Pushes to `main` run the [release workflow](.github/workflows/release.yml):
 [`semantic-release`](https://github.com/semantic-release/semantic-release)
 analyzes the Conventional Commits and computes + tags the next version, then
 [GoReleaser](https://goreleaser.com) builds the cross-platform binaries, creates
-the Gitea Release (with notes and checksums), and publishes the multi-arch image
-to `git.gasi.dev/robin/kiro-proxy`.
-
-The GitHub mirror runs [`ghcr.yml`](.github/workflows/ghcr.yml) instead, publishing
-the multi-arch image to `ghcr.io/robingasi/kiro-proxy` (`latest`, `sha-*`, and
-semver tags). Public install notes:
+the GitHub Release (with notes and checksums), and publishes the multi-arch image
+to `ghcr.io/robingasi/kiro-proxy` (`<version>`, `<major>.<minor>`, `latest`).
+Public install notes:
 <https://gist.github.com/RobinGasi/c6ee980e39d169fe34b7786d6ef68822>.
 
 ## License

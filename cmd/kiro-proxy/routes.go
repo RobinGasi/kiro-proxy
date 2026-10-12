@@ -6,14 +6,14 @@ import (
 	"log/slog"
 	"net/http"
 
-	"git.gasi.dev/robin/kiro-proxy/internal/account"
-	"git.gasi.dev/robin/kiro-proxy/internal/api/anthropic"
-	"git.gasi.dev/robin/kiro-proxy/internal/api/openai"
-	"git.gasi.dev/robin/kiro-proxy/internal/config"
-	"git.gasi.dev/robin/kiro-proxy/internal/mcp"
-	"git.gasi.dev/robin/kiro-proxy/internal/model"
-	"git.gasi.dev/robin/kiro-proxy/internal/transport"
-	"git.gasi.dev/robin/kiro-proxy/internal/upstream"
+	"github.com/RobinGasi/kiro-proxy/internal/account"
+	"github.com/RobinGasi/kiro-proxy/internal/api/anthropic"
+	"github.com/RobinGasi/kiro-proxy/internal/api/openai"
+	"github.com/RobinGasi/kiro-proxy/internal/config"
+	"github.com/RobinGasi/kiro-proxy/internal/mcp"
+	"github.com/RobinGasi/kiro-proxy/internal/model"
+	"github.com/RobinGasi/kiro-proxy/internal/transport"
+	"github.com/RobinGasi/kiro-proxy/internal/upstream"
 )
 
 // deps holds the shared dependencies wired into the HTTP handlers.

@@ -2,15 +2,17 @@ name: release
 
 # Conventional-commit-driven release. semantic-release analyzes the commits on
 # main, computes the next semver and pushes the tag; GoReleaser then builds the
-# binaries, creates the Gitea Release, and pushes the multi-arch image to the
-# Gitea container registry. Runs under Gitea Actions (needs a registered runner).
+# binaries, creates the GitHub Release, and pushes the multi-arch image to
+# ghcr.io/robingasi/kiro-proxy.
 on:
   push:
     branches: [main]
+  # Re-publish the release tagged at HEAD (e.g. after a failed publish step).
+  workflow_dispatch:
 
 permissions:
   contents: write # semantic-release pushes tags; GoReleaser creates releases
-  packages: write # push images to the Gitea container registry
+  packages: write # push images to ghcr.io
 
 concurrency:
   group: release-${{ github.ref }}
@@ -28,8 +30,6 @@ jobs:
       - run: go test ./...
 
   release:
-    # Gitea/Forgejo only; the GitHub mirror publishes via ghcr.yml instead.
-    if: github.server_url != 'https://github.com'
     needs: test
     runs-on: ubuntu-latest
     steps:
@@ -106,16 +106,13 @@ jobs:
         if: steps.release-state.outputs.publish == 'true'
         uses: docker/setup-buildx-action@v3
 
-      # Push the multi-arch image and create/replace the Gitea Release with the
-      # fresh PAT stored as PUBLISH_TOKEN. Forgejo's automatic Actions token does
-      # not have sufficient API/package access on this instance.
-      - name: Log in to the Gitea container registry
+      - name: Log in to ghcr.io
         if: steps.release-state.outputs.publish == 'true'
         uses: docker/login-action@v3
         with:
-          registry: git.gasi.dev
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.PUBLISH_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install GoReleaser
         if: steps.release-state.outputs.publish == 'true'
@@ -128,34 +125,5 @@ jobs:
       - name: GoReleaser
         if: steps.release-state.outputs.publish == 'true'
         env:
-          # Forgejo also injects GITHUB_TOKEN; force GoReleaser to use Gitea and
-          # select the verified publish PAT supplied as GITEA_TOKEN.
-          GORELEASER_FORCE_TOKEN: gitea
-          GITEA_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
-        run: |
-          proxy_log="$RUNNER_TEMP/gitea-api-proxy.log"
-          release_config="$RUNNER_TEMP/goreleaser.yaml"
-          sed 's#api: https://git.gasi.dev/api/v1#api: http://127.0.0.1:18080/api/v1#' \
-            .goreleaser.yaml > "$release_config"
-
-          python3 .github/scripts/gitea-api-proxy.py > "$proxy_log" 2>&1 &
-          proxy_pid=$!
-          trap 'kill "$proxy_pid" 2>/dev/null || true; cat "$proxy_log"' EXIT
-
-          for attempt in $(seq 1 20); do
-            if curl --fail --silent --show-error http://127.0.0.1:18080/api/v1/version >/dev/null; then
-              break
-            fi
-            if ! kill -0 "$proxy_pid" 2>/dev/null; then
-              echo "Gitea API proxy exited during startup" >&2
-              exit 1
-            fi
-            if [ "$attempt" -eq 20 ]; then
-              echo "Gitea API proxy did not become ready" >&2
-              exit 1
-            fi
-            sleep 0.25
-          done
-
-          goreleaser release --config "$release_config" --clean \
-            --release-notes=/tmp/release-notes.md
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: goreleaser release --clean --release-notes=/tmp/release-notes.md

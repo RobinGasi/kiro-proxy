@@ -18,9 +18,9 @@ import (
 	"strings"
 	"time"
 
-	"git.gasi.dev/robin/kiro-proxy/internal/config"
-	"git.gasi.dev/robin/kiro-proxy/internal/model"
-	"git.gasi.dev/robin/kiro-proxy/internal/util"
+	"github.com/RobinGasi/kiro-proxy/internal/config"
+	"github.com/RobinGasi/kiro-proxy/internal/model"
+	"github.com/RobinGasi/kiro-proxy/internal/util"
 )
 
 // Endpoint paths on the Kiro runtime hosts.

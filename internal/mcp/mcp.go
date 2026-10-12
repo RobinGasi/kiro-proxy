@@ -34,9 +34,9 @@ import (
 	"strings"
 	"time"
 
-	"git.gasi.dev/robin/kiro-proxy/internal/debuglog"
-	"git.gasi.dev/robin/kiro-proxy/internal/tokenizer"
-	"git.gasi.dev/robin/kiro-proxy/internal/util"
+	"github.com/RobinGasi/kiro-proxy/internal/debuglog"
+	"github.com/RobinGasi/kiro-proxy/internal/tokenizer"
+	"github.com/RobinGasi/kiro-proxy/internal/util"
 )
 
 // WebSearchToolName is the tool name used for both the injected emulation tool

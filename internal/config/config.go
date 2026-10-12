@@ -41,7 +41,7 @@ const (
 
 // AppVersion is the build version. It is a var (not a const) so the release
 // build can override it at link time via
-// -ldflags "-X git.gasi.dev/robin/kiro-proxy/internal/config.AppVersion=<v>".
+// -ldflags "-X github.com/RobinGasi/kiro-proxy/internal/config.AppVersion=<v>".
 // The -X flag only works on string vars, so keep this a var.
 var AppVersion = "0.0.0-dev"
 

@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"log/slog"
 
-	"git.gasi.dev/robin/kiro-proxy/internal/config"
-	"git.gasi.dev/robin/kiro-proxy/internal/truncation"
+	"github.com/RobinGasi/kiro-proxy/internal/config"
+	"github.com/RobinGasi/kiro-proxy/internal/truncation"
 )
 
 // thinkingInstruction is the reasoning-quality guidance injected with the

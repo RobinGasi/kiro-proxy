@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"git.gasi.dev/robin/kiro-proxy/internal/converter"
+	"github.com/RobinGasi/kiro-proxy/internal/converter"
 )
 
 // Regression for the headline bug: a request with an inline role:"system"

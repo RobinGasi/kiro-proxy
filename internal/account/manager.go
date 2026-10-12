@@ -33,10 +33,10 @@ import (
 	"sync"
 	"time"
 
-	"git.gasi.dev/robin/kiro-proxy/internal/auth"
-	"git.gasi.dev/robin/kiro-proxy/internal/config"
-	"git.gasi.dev/robin/kiro-proxy/internal/model"
-	"git.gasi.dev/robin/kiro-proxy/internal/modelcache"
+	"github.com/RobinGasi/kiro-proxy/internal/auth"
+	"github.com/RobinGasi/kiro-proxy/internal/config"
+	"github.com/RobinGasi/kiro-proxy/internal/model"
+	"github.com/RobinGasi/kiro-proxy/internal/modelcache"
 )
 
 // ModelFetcher fetches an account's model catalog from upstream — model IDs plus

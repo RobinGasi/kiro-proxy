@@ -18,7 +18,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"git.gasi.dev/robin/kiro-proxy/internal/util"
+	"github.com/RobinGasi/kiro-proxy/internal/util"
 )
 
 // Event type identifiers returned by (*Parser).FeedStream.

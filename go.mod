@@ -1,4 +1,4 @@
-module git.gasi.dev/robin/kiro-proxy
+module github.com/RobinGasi/kiro-proxy
 
 go 1.26.4
 

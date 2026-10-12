@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"git.gasi.dev/robin/kiro-proxy/internal/config"
+	"github.com/RobinGasi/kiro-proxy/internal/config"
 )
 
 func TestBuildKiroPayloadUsesNativeClaudeReasoningWithoutXML(t *testing.T) {

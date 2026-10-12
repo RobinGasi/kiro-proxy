@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"git.gasi.dev/robin/kiro-proxy/internal/model"
+	"github.com/RobinGasi/kiro-proxy/internal/model"
 )
 
 func quietLogger() *slog.Logger {

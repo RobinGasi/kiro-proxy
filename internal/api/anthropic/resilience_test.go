@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"git.gasi.dev/robin/kiro-proxy/internal/streaming"
+	"github.com/RobinGasi/kiro-proxy/internal/streaming"
 )
 
 func TestClassifyUpstreamErrorUsesAnthropicTaxonomy(t *testing.T) {

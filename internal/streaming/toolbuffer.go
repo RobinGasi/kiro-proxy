@@ -3,7 +3,7 @@ package streaming
 import (
 	"strings"
 
-	"git.gasi.dev/robin/kiro-proxy/internal/awsstream"
+	"github.com/RobinGasi/kiro-proxy/internal/awsstream"
 )
 
 type taggedToolBuffer struct {

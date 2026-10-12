@@ -34,7 +34,7 @@ import (
 	"strings"
 	"time"
 
-	"git.gasi.dev/robin/kiro-proxy/internal/util"
+	"github.com/RobinGasi/kiro-proxy/internal/util"
 )
 
 // Kiro's non-streaming usage-limits operation, recovered from the IDE bundle.

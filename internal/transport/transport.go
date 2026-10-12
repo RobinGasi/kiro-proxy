@@ -13,7 +13,7 @@ import (
 
 	"golang.org/x/net/proxy"
 
-	"git.gasi.dev/robin/kiro-proxy/internal/config"
+	"github.com/RobinGasi/kiro-proxy/internal/config"
 )
 
 // New builds an *http.Client with a tuned Transport. VPNProxyURL may be empty

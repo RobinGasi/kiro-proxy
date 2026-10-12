@@ -8,10 +8,10 @@ import (
 	"log/slog"
 	"strings"
 
-	"git.gasi.dev/robin/kiro-proxy/internal/config"
-	"git.gasi.dev/robin/kiro-proxy/internal/model"
-	"git.gasi.dev/robin/kiro-proxy/internal/payloadguard"
-	"git.gasi.dev/robin/kiro-proxy/internal/util"
+	"github.com/RobinGasi/kiro-proxy/internal/config"
+	"github.com/RobinGasi/kiro-proxy/internal/model"
+	"github.com/RobinGasi/kiro-proxy/internal/payloadguard"
+	"github.com/RobinGasi/kiro-proxy/internal/util"
 )
 
 // ErrNoMessages is returned by [BuildKiroPayload] when, after normalization,
