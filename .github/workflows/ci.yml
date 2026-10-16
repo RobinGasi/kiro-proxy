@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build-test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -24,7 +24,7 @@ jobs:
       - run: go test ./...
 
   omp-kiro:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER || 'ubuntu-latest' }}
     defaults:
       run:
         working-directory: omp-kiro
@@ -38,7 +38,7 @@ jobs:
   # Validate the GoReleaser config (and a full dry-run build) before it can reach
   # main, so a broken release pipeline is caught on the PR instead of at release.
   goreleaser:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
         with:
